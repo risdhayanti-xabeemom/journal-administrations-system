@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+
+.env
+.streamlit/secrets.toml
+
+jas.db
+*.db
+
+private_uploads/
+generated_documents/
+
+.pytest_cache/

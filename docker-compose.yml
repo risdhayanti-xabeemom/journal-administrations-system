@@ -1,0 +1,38 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: jas
+      POSTGRES_USER: jas_user
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    volumes:
+      - jas_postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U jas_user -d jas"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+  app:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg://jas_user:${POSTGRES_PASSWORD}@db:5432/jas
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8501}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:?set ADMIN_EMAIL}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?set ADMIN_PASSWORD}
+      ADMIN_NAME: ${ADMIN_NAME:-System Administrator}
+      PRIVATE_UPLOAD_DIR: /data/uploads
+      DOCUMENT_OUTPUT_DIR: /data/documents
+      TEMPLATE_STORAGE_DIR: /data/templates
+      DOCX_PDF_CONVERTER: libreoffice
+    volumes:
+      - jas_files:/data
+    ports:
+      - "8501:8501"
+    restart: unless-stopped
+
+volumes:
+  jas_postgres:
+  jas_files:

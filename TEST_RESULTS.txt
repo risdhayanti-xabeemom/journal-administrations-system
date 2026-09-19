@@ -1,0 +1,35 @@
+JAS Master LoA revision verification
+Run date: 2026-09-16 (Asia/Bangkok)
+
+Automated tests
+Command: python -m pytest -q
+Result: 10 passed in 26.09s
+
+Covered:
+- salted password hashing and verification
+- invoice formula, consistent Indonesian Rupiah formatting, and upload validation
+- transaction-backed LoA numbering for IX, X, XI, XII and year rollover
+- Master DOCX upload, versioning, activation, and previous-version retention
+- ELKOLIND dynamic replacement and preservation of Editor-in-Chief name/NIP
+- JASENS dynamic replacement and preservation of Editor-in-Chief name
+- optional LoA QR embedding while retaining official media bytes
+- preview without sequence consumption or VALID verification record
+- public LoA verification by retained document number
+- independent editorial/publication state transitions
+- ACCEPTED -> Issue LoA -> Reissue -> Invoice -> Payment Submitted -> Payment Verified -> Receipt
+- reissue requires a reason; old LoA becomes SUPERSEDED and new LoA is VALID
+
+Migration rehearsal
+- Ran scripts/migrate_master_loa.py against a copy of the existing jas.db.
+- A timestamped pre-migration backup was created automatically.
+- Row counts matched before/after for users, journals, submissions, authors, LoAs,
+  invoices, payments, receipts, audit logs, verifications, and sequences.
+- document_templates and all additive columns were present after migration.
+- The original jas.db used for the project was not modified during rehearsal.
+
+Visual regression
+- ELKOLIND sample: 1 page, static header ratio 0.000000, footer ratio 0.000000.
+- JASENS sample: 1 page, static header ratio 0.000000; indexing-logo bounding
+  box matched the reference within one raster pixel.
+- All source/master/sample DOCX media assets stayed byte-identical.
+- Sample invoice and receipt were rendered and manually inspected as one-page PDFs.
