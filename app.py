@@ -4,6 +4,7 @@ import re
 import uuid
 import json
 import base64
+import hashlib
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -73,6 +74,18 @@ from services.template_service import (
     upload_loa_template,
 )
 from services.database import SessionLocal, init_database
+from services.ojs_import import (
+    FIELD_ALIASES,
+    REQUIRED_FIELDS,
+    ImportFileError,
+    build_preview,
+    confirm_import,
+    detect_columns,
+    error_report_csv,
+    metadata_flag,
+    preview_table,
+    read_import_file,
+)
 
 
 st.set_page_config(page_title="Journal Administration System", page_icon="📚", layout="wide")
@@ -272,6 +285,7 @@ def submission_rows(items: list[Submission]) -> pd.DataFrame:
                 "OJS ID": item.ojs_submission_id or "Manual",
                 "Title": item.manuscript_title,
                 "Corresponding author": item.corresponding_author,
+                "Metadata": "INCOMPLETE_METADATA" if metadata_flag(item.notes) else "READY",
                 "Editorial": item.editorial_status.value,
                 "Financial": next((inv.status.value for inv in sorted(item_invoices(item), key=lambda x: x.created_at, reverse=True)), "NOT_INVOICED"),
                 "Publication": item.publication_status.value,
@@ -443,47 +457,77 @@ def import_submissions(session, journal: Journal, user: User) -> None:
     except AuthorizationError as exc:
         st.error(str(exc))
         return
-    st.caption("Required columns: manuscript_title, corresponding_author, email. Optional: ojs_submission_id, affiliation, date_submitted, authors, planned_volume, planned_issue, planned_publication_month, planned_year, notes.")
-    uploaded = st.file_uploader("CSV or Excel file", type=["csv", "xlsx"])
+    st.caption("Required data: OJS Submission ID and Manuscript Title. Other metadata can be completed after import.")
+    uploaded = st.file_uploader("OJS CSV or XLSX report", type=["csv", "xlsx"])
     if not uploaded:
         return
     try:
-        frame = pd.read_csv(uploaded) if uploaded.name.lower().endswith(".csv") else pd.read_excel(uploaded)
-    except Exception as exc:
-        st.error(f"Cannot read file: {exc}")
+        content = uploaded.getvalue()
+        table = read_import_file(uploaded.name, content)
+    except ImportFileError as exc:
+        st.error(str(exc))
         return
-    st.dataframe(frame.head(20), use_container_width=True)
-    required = {"manuscript_title", "corresponding_author", "email"}
-    missing = required - set(frame.columns)
-    if missing:
-        st.error(f"Missing columns: {', '.join(sorted(missing))}")
+    file_key = hashlib.sha256(content).hexdigest()[:16]
+    detected, warnings = detect_columns(table.headers)
+    st.subheader("OJS Column Mapping")
+    st.caption("Automatic matches are preselected. Review all fields; ambiguous columns remain unselected.")
+    mapping: dict[str, int | None] = {}
+    field_labels = {
+        "ojs_submission_id": "OJS Submission ID",
+        "manuscript_title": "Manuscript Title",
+        "authors": "Authors",
+        "corresponding_author": "Corresponding Author",
+        "email": "Email",
+        "affiliation": "Affiliation",
+        "editorial_status": "Editorial Status",
+        "date_submitted": "Date Submitted",
+        "date_accepted": "Date Accepted",
+        "planned_volume": "Volume",
+        "planned_issue": "Issue",
+        "planned_publication_month": "Publication Month",
+        "planned_year": "Publication Year",
+        "notes": "Notes",
+    }
+    for field in FIELD_ALIASES:
+        label_col, input_col = st.columns([2, 3])
+        label_col.write(field_labels[field] + (" *required*" if field in REQUIRED_FIELDS else ""))
+        options = [None, *range(len(table.headers))]
+        mapping[field] = input_col.selectbox(
+            field_labels[field], options, index=options.index(detected[field]),
+            format_func=lambda index: "— Not mapped —" if index is None else f"{table.headers[index]} (column {index + 1})",
+            key=f"ojs-map-{journal.id}-{file_key}-{field}", label_visibility="collapsed",
+        )
+        if field in warnings:
+            st.caption(f"{field_labels[field]}: {warnings[field]}")
+    if any(mapping[field] is None for field in REQUIRED_FIELDS):
+        st.error("Select the OJS ID and manuscript title columns to continue.")
         return
-    if st.button("Import validated rows", type="primary"):
-        created, skipped = 0, 0
+    policy = st.radio("Existing submissions", ["Skip existing", "Update existing metadata"], horizontal=True,
+                      help="Updates only unprotected descriptive metadata. Accepted, publication, LoA, invoice, and payment information is never overwritten.")
+    try:
+        preview = build_preview(session, journal, table, mapping, update_existing=policy == "Update existing metadata")
+    except ValueError as exc:
+        st.error(str(exc))
+        return
+    st.subheader("Import preview — no database changes yet")
+    st.dataframe(preview_table(preview), use_container_width=True, hide_index=True)
+    if not preview:
+        st.warning("No data rows found in this report.")
+        return
+    if st.button("Confirm Import", type="primary"):
         try:
-            for _, row in frame.fillna("").iterrows():
-                ojs_id = str(row.get("ojs_submission_id", "")).strip() or None
-                if ojs_id and session.scalar(select(Submission).where(Submission.journal_id == journal.id, Submission.ojs_submission_id == ojs_id)):
-                    skipped += 1
-                    continue
-                email = str(row["email"]).strip().lower()
-                if not str(row["manuscript_title"]).strip() or not str(row["corresponding_author"]).strip() or "@" not in email:
-                    skipped += 1
-                    continue
-                year_value = str(row.get("planned_year", "")).strip()
-                item = Submission(journal_id=journal.id, ojs_submission_id=ojs_id, manuscript_title=str(row["manuscript_title"]).strip(), corresponding_author=str(row["corresponding_author"]).strip(), email=email, affiliation=str(row.get("affiliation", "")).strip() or None, planned_volume=str(row.get("planned_volume", "")).strip() or journal.default_volume, planned_issue=str(row.get("planned_issue", "")).strip() or journal.default_issue, planned_publication_month=str(row.get("planned_publication_month", "")).strip() or journal.default_publication_month, planned_year=int(float(year_value)) if year_value else journal.default_publication_year, notes=str(row.get("notes", "")).strip() or None, created_by=user.id)
-                session.add(item)
-                session.flush()
-                author_names = [x.strip() for x in str(row.get("authors", "")).split(";") if x.strip()] or [item.corresponding_author]
-                for position, name in enumerate(author_names, 1):
-                    session.add(Author(submission_id=item.id, name=name, email=email if name == item.corresponding_author else None, affiliation=item.affiliation, is_corresponding=name == item.corresponding_author, position=position))
-                log_audit(session, action="SUBMISSION_IMPORTED", object_type="submission", object_id=item.id, user_id=user.id, journal_id=journal.id, new={"ojs_submission_id": ojs_id})
-                created += 1
-            session.commit()
-            st.success(f"Imported {created} rows; skipped {skipped} invalid or duplicate rows.")
+            result = confirm_import(session, journal, user, table, mapping, uploaded.name,
+                                    update_existing=policy == "Update existing metadata")
+            st.session_state[f"ojs-import-result-{journal.id}-{file_key}"] = result
         except Exception as exc:
             session.rollback()
             notice_error(exc)
+    result = st.session_state.get(f"ojs-import-result-{journal.id}-{file_key}")
+    if result:
+        st.success(f"Imported: {result.imported} · Skipped duplicates: {result.skipped_duplicates} · "
+                   f"Updated: {result.updated} · Incomplete: {result.incomplete} · Invalid: {result.invalid}")
+        st.download_button("Download import error report", error_report_csv(result),
+                           file_name="ojs_import_errors.csv", mime="text/csv")
 
 
 def loa_page(session, journal: Journal, user: User) -> None:

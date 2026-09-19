@@ -29,6 +29,7 @@ services/
   database.py                  engine, transactions, schema initialization
   core.py                      auth, authorization, workflow, numbering,
                                PDF/QR, payment, verification, reports, audit
+  ojs_import.py                alias mapping, CSV/XLSX preview, partial import
   ojs_service.py               future OJS adapter contract
 migrations/001_initial_postgresql.sql
 scripts/init_db.py
@@ -151,7 +152,17 @@ Raw token pembayaran hanya ditampilkan satu kali ketika invoice diterbitkan; dat
 pytest -q
 ```
 
-Tes mencakup hashing password, format Rupiah, upload/versioning/activation Master DOCX, replacement ELKOLIND dan JASENS beserta identitas Editor-in-Chief statis, bulan Romawi IX–XII dan rollover tahun, preview tanpa konsumsi nomor, state transition, serta lifecycle LoA–invoice–payment–receipt pada SQLite terisolasi.
+Tes mencakup hashing password, format Rupiah, upload/versioning/activation Master DOCX, replacement ELKOLIND dan JASENS beserta identitas Editor-in-Chief statis, bulan Romawi IX–XII dan rollover tahun, preview tanpa konsumsi nomor, state transition, lifecycle LoA–invoice–payment–receipt, serta alias/pemetaan/impor parsial CSV-XLSX OJS pada SQLite terisolasi.
+
+## Impor laporan OJS (CSV/XLSX)
+
+Pada `SUBMISSIONS → Import CSV/Excel`, unggah file, periksa `OJS Column Mapping`, lalu tinjau status setiap baris sebelum menekan `Confirm Import`. Hanya **OJS Submission ID** dan **Manuscript Title** yang wajib. Alias dideteksi tanpa memperhatikan huruf besar/kecil, spasi, atau tanda hubung. Bila sebuah kolom cocok untuk lebih dari satu field, pilihan dibiarkan kosong agar editor memetakan secara manual. CSV UTF-8/BOM dengan pemisah umum dan XLSX didukung; `.xls` tidak termasuk format yang didukung aplikasi ini.
+
+Pratinjau menampilkan `READY`, `DUPLICATE`, `MISSING_REQUIRED_FIELD`, `INCOMPLETE_METADATA`, atau `INVALID_ROW`. Data opsional yang belum lengkap tetap diimpor dan diberi penanda `INCOMPLETE_METADATA` pada catatan submission serta daftar submission. Baris tanpa ID/judul atau malformed dilewati; baris valid lainnya tetap diproses. Ringkasan dan laporan kesalahan CSV tersedia setelah konfirmasi.
+
+Duplikasi diperiksa dengan pasangan `journal_id + ojs_submission_id`. `Skip existing` adalah pilihan awal. `Update existing metadata` hanya memperbarui metadata deskriptif pada submission yang belum berstatus accepted/published dan belum memiliki LoA atau invoice. Urutan penulis dari OJS dipertahankan; pemisah `;` atau baris baru dianggap jelas, sedangkan daftar penulis yang ambigu disimpan mentah dan ditandai untuk pemeriksaan. HTML entity didekode, tag HTML tidak dirender, dan impor dicatat dalam audit log per baris serta per batch tanpa path lokal.
+
+Tidak ada perubahan skema database atau dependensi baru untuk revisi impor ini. Lihat [OJS_IMPORT_UPGRADE.md](OJS_IMPORT_UPGRADE.md) untuk langkah upgrade dan push.
 
 Langkah smoke test manual:
 
