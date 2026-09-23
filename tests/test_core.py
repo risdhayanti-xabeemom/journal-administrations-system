@@ -193,14 +193,16 @@ def test_jasens_dynamic_replacement_and_static_editor_preserved(tmp_path):
 
 def test_optional_loa_qr_is_embedded_without_replacing_official_media(tmp_path):
     output = tmp_path / "jasens-with-qr.docx"
+    verification_url = "https://journals.example.test/?verify=test-token"
     generate_from_template(JASENS_TEMPLATE, output, {
         "loa_number": "04/IX/JASENS/2026", "recipient_name": "Recipient Name",
         "recipient_affiliation": "Affiliation Name", "article_title": "Article Title",
         "authors": "Author One, Author Two", "volume": "7", "issue": "2",
         "publication_month": "September", "publication_year": "2026",
-    }, qr_url="https://journals.example.test/verify/test-token", qr_size_mm=18, qr_placement="bottom-right")
+    }, qr_url=verification_url, qr_size_mm=18, qr_placement="bottom-right", qr_label="Scan to Verify LoA")
     with ZipFile(JASENS_TEMPLATE) as original, ZipFile(output) as generated:
         assert "word/media/verification-qr.png" in generated.namelist()
+        assert b"Scan to Verify LoA" in generated.read("word/document.xml")
         for name in ("word/media/image1.jpeg", "word/media/image2.jpeg"):
             assert generated.read(name) == original.read(name)
 
@@ -240,6 +242,13 @@ def test_complete_document_and_payment_lifecycle(session, records, fake_loa_rend
     session.commit()
     assert reissued.version == 2 and reissued.status == LoAStatus.VALID
     assert loa.status == LoAStatus.SUPERSEDED
+    superseded_audit = session.scalar(
+        select(core.AuditLog).where(
+            core.AuditLog.action == "VERIFICATION_DOCUMENT_SUPERSEDED"
+        )
+    )
+    assert superseded_audit is not None
+    assert loa.verification.token not in (superseded_audit.new_value or "")
     invoice, raw_token = issue_invoice(
         session, submission, user, due_date=date.today() + timedelta(days=14),
         apc=Decimal("1000000"), discount=Decimal("100000"), additional_charge=Decimal("25000"),

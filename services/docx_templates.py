@@ -16,6 +16,7 @@ from zipfile import BadZipFile, ZIP_DEFLATED, ZipFile
 
 from lxml import etree
 import qrcode
+from PIL import Image as PILImage, ImageDraw, ImageFont
 
 from config import BASE_DIR, settings
 
@@ -193,7 +194,15 @@ def extract_placeholders(path: str | Path) -> set[str]:
     return found
 
 
-def _qr_drawing_xml(relationship_id: str, size_emu: int, placement: str, x_emu: int = 0, y_emu: int = 0) -> etree._Element:
+def _qr_drawing_xml(
+    relationship_id: str,
+    width_emu: int,
+    height_emu: int,
+    placement: str,
+    x_emu: int = 0,
+    y_emu: int = 0,
+    label: str = "Verify Document",
+) -> etree._Element:
     namespaces = {
         "w": WORD_NS,
         "wp": "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing",
@@ -204,13 +213,13 @@ def _qr_drawing_xml(relationship_id: str, size_emu: int, placement: str, x_emu: 
     if placement == "template-placeholder":
         frame = f"""
         <wp:inline distT="0" distB="0" distL="0" distR="0">
-          <wp:extent cx="{size_emu}" cy="{size_emu}"/>
-          <wp:docPr id="9901" name="LoA verification QR"/>
+          <wp:extent cx="{width_emu}" cy="{height_emu}"/>
+          <wp:docPr id="9901" name="LoA verification QR" descr="{html.escape(label, quote=True)}"/>
           <wp:cNvGraphicFramePr/>
           <a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">
             <pic:pic><pic:nvPicPr><pic:cNvPr id="0" name="verification-qr.png"/><pic:cNvPicPr/></pic:nvPicPr>
             <pic:blipFill><a:blip r:embed="{relationship_id}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>
-            <pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="{size_emu}" cy="{size_emu}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr>
+            <pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="{width_emu}" cy="{height_emu}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr>
             </pic:pic>
           </a:graphicData></a:graphic>
         </wp:inline>"""
@@ -220,25 +229,62 @@ def _qr_drawing_xml(relationship_id: str, size_emu: int, placement: str, x_emu: 
           <wp:simplePos x="0" y="0"/>
           <wp:positionH relativeFrom="page"><wp:posOffset>{x_emu}</wp:posOffset></wp:positionH>
           <wp:positionV relativeFrom="page"><wp:posOffset>{y_emu}</wp:posOffset></wp:positionV>
-          <wp:extent cx="{size_emu}" cy="{size_emu}"/><wp:effectExtent l="0" t="0" r="0" b="0"/><wp:wrapNone/>
-          <wp:docPr id="9901" name="LoA verification QR"/><wp:cNvGraphicFramePr/>
+          <wp:extent cx="{width_emu}" cy="{height_emu}"/><wp:effectExtent l="0" t="0" r="0" b="0"/><wp:wrapNone/>
+          <wp:docPr id="9901" name="LoA verification QR" descr="{html.escape(label, quote=True)}"/><wp:cNvGraphicFramePr/>
           <a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">
             <pic:pic><pic:nvPicPr><pic:cNvPr id="0" name="verification-qr.png"/><pic:cNvPicPr/></pic:nvPicPr>
             <pic:blipFill><a:blip r:embed="{relationship_id}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>
-            <pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="{size_emu}" cy="{size_emu}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr>
+            <pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="{width_emu}" cy="{height_emu}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr>
             </pic:pic>
           </a:graphicData></a:graphic>
         </wp:anchor>"""
     return etree.fromstring(f'<w:drawing xmlns:w="{namespaces["w"]}" xmlns:wp="{namespaces["wp"]}" xmlns:a="{namespaces["a"]}" xmlns:pic="{namespaces["pic"]}" xmlns:r="{namespaces["r"]}">{frame}</w:drawing>')
 
 
-def inject_verification_qr(docx_path: str | Path, url: str, *, size_mm: int, placement: str) -> None:
+def _labelled_qr_png(url: str, label: str) -> tuple[bytes, float]:
+    """Create a labelled QR image while keeping the encoded payload URL-only."""
+    qr = qrcode.QRCode(
+        error_correction=qrcode.constants.ERROR_CORRECT_M,
+        box_size=12,
+        border=4,
+    )
+    qr.add_data(url)
+    qr.make(fit=True)
+    qr_image = qr.make_image(fill_color="black", back_color="white").convert("RGB")
+    font = ImageFont.load_default()
+    temporary_draw = ImageDraw.Draw(qr_image)
+    left, top, right, bottom = temporary_draw.textbbox((0, 0), label, font=font)
+    text_width, text_height = right - left, bottom - top
+    gap = max(8, qr_image.width // 60)
+    padding = max(10, qr_image.width // 50)
+    canvas_width = max(qr_image.width, text_width + (padding * 2))
+    canvas_height = qr_image.height + gap + text_height + padding
+    canvas = PILImage.new("RGB", (canvas_width, canvas_height), "white")
+    canvas.paste(qr_image, ((canvas_width - qr_image.width) // 2, 0))
+    draw = ImageDraw.Draw(canvas)
+    draw.text(
+        ((canvas_width - text_width) // 2, qr_image.height + gap),
+        label,
+        fill="black",
+        font=font,
+    )
+    image_buffer = io.BytesIO()
+    canvas.save(image_buffer, format="PNG")
+    return image_buffer.getvalue(), canvas_height / canvas_width
+
+
+def inject_verification_qr(
+    docx_path: str | Path,
+    url: str,
+    *,
+    size_mm: int,
+    placement: str,
+    label: str = "Scan to Verify LoA",
+) -> None:
     path = Path(docx_path)
     if size_mm < 10 or size_mm > 40:
         raise TemplateError("LoA QR size must be between 10 and 40 mm.")
-    image = qrcode.make(url)
-    image_buffer = io.BytesIO()
-    image.save(image_buffer, format="PNG")
+    image_bytes, image_ratio = _labelled_qr_png(url, label)
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.qr.tmp")
     with ZipFile(path, "r") as source_zip:
         document_root = etree.fromstring(source_zip.read("word/document.xml"))
@@ -253,7 +299,8 @@ def inject_verification_qr(docx_path: str | Path, url: str, *, size_mm: int, pla
             "Type": "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image",
             "Target": "media/verification-qr.png",
         })
-        size_emu = int(size_mm * 36000)
+        width_emu = int(size_mm * 36000)
+        height_emu = int(width_emu * image_ratio)
         page_width, page_height = 11908800, 16835760
         pg_size = document_root.find(".//w:sectPr/w:pgSz", namespaces=NS)
         if pg_size is not None:
@@ -262,9 +309,9 @@ def inject_verification_qr(docx_path: str | Path, url: str, *, size_mm: int, pla
         inset = int(10 * 36000)
         positions = {
             "top-left": (inset, inset),
-            "top-right": (page_width - size_emu - inset, inset),
-            "bottom-left": (inset, page_height - size_emu - inset),
-            "bottom-right": (page_width - size_emu - inset, page_height - size_emu - inset),
+            "top-right": (page_width - width_emu - inset, inset),
+            "bottom-left": (inset, page_height - height_emu - inset),
+            "bottom-right": (page_width - width_emu - inset, page_height - height_emu - inset),
         }
         if placement == "template-placeholder":
             target_run = None
@@ -276,14 +323,32 @@ def inject_verification_qr(docx_path: str | Path, url: str, *, size_mm: int, pla
                     break
             if target_run is None:
                 raise TemplateError("QR placement is 'template-placeholder', but {{verification_qr}} is not present.")
-            target_run.append(_qr_drawing_xml(relationship_id, size_emu, placement))
+            target_run.append(
+                _qr_drawing_xml(
+                    relationship_id,
+                    width_emu,
+                    height_emu,
+                    placement,
+                    label=label,
+                )
+            )
         else:
             if placement not in positions:
                 raise TemplateError(f"Unsupported LoA QR placement: {placement}")
             x_emu, y_emu = positions[placement]
             paragraph = etree.Element(f"{{{WORD_NS}}}p")
             run = etree.SubElement(paragraph, f"{{{WORD_NS}}}r")
-            run.append(_qr_drawing_xml(relationship_id, size_emu, placement, x_emu, y_emu))
+            run.append(
+                _qr_drawing_xml(
+                    relationship_id,
+                    width_emu,
+                    height_emu,
+                    placement,
+                    x_emu,
+                    y_emu,
+                    label=label,
+                )
+            )
             body = document_root.find(".//w:body", namespaces=NS)
             section = body.find("w:sectPr", namespaces=NS)
             body.insert(body.index(section) if section is not None else len(body), paragraph)
@@ -299,7 +364,7 @@ def inject_verification_qr(docx_path: str | Path, url: str, *, size_mm: int, pla
         with ZipFile(temporary, "w", ZIP_DEFLATED) as output_zip:
             for info in source_zip.infolist():
                 output_zip.writestr(info, changed.get(info.filename, source_zip.read(info.filename)))
-            output_zip.writestr("word/media/verification-qr.png", image_buffer.getvalue())
+            output_zip.writestr("word/media/verification-qr.png", image_bytes)
     os.replace(temporary, path)
 
 
@@ -423,6 +488,7 @@ def generate_from_template(
     qr_url: str | None = None,
     qr_size_mm: int = 20,
     qr_placement: str = "bottom-right",
+    qr_label: str = "Scan to Verify LoA",
 ) -> GeneratedLoA:
     replacements = {
         f"{{{{{key}}}}}": value
@@ -431,7 +497,13 @@ def generate_from_template(
     }
     replace_docx_text(template_path, output_docx, replacements, require_all=False)
     if qr_url:
-        inject_verification_qr(output_docx, qr_url, size_mm=qr_size_mm, placement=qr_placement)
+        inject_verification_qr(
+            output_docx,
+            qr_url,
+            size_mm=qr_size_mm,
+            placement=qr_placement,
+            label=qr_label,
+        )
     remaining = extract_placeholders(output_docx)
     unresolved = sorted(item for item in remaining if item not in {"{{verification_qr}}"})
     if unresolved:

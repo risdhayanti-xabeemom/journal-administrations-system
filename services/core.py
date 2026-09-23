@@ -13,6 +13,7 @@ from decimal import Decimal
 from html import escape
 from pathlib import Path
 from typing import Iterable
+from urllib.parse import urlencode
 
 import pandas as pd
 import qrcode
@@ -311,9 +312,20 @@ def create_verification(
     submission: Submission,
     document_number: str,
     issue_date: date,
+    actor: User | None = None,
 ) -> DocumentVerification:
+    token = ""
+    for _ in range(8):
+        candidate = secrets.token_urlsafe(32)
+        if session.scalar(
+            select(DocumentVerification.id).where(DocumentVerification.token == candidate)
+        ) is None:
+            token = candidate
+            break
+    if not token:
+        raise BusinessRuleError("A unique document verification token could not be created.")
     record = DocumentVerification(
-        token=secrets.token_urlsafe(32),
+        token=token,
         document_type=document_type,
         journal_id=journal.id,
         submission_id=submission.id,
@@ -323,11 +335,28 @@ def create_verification(
     )
     session.add(record)
     session.flush()
+    if actor is not None:
+        log_audit(
+            session,
+            action="VERIFICATION_TOKEN_CREATED",
+            object_type="document_verification",
+            object_id=record.id,
+            user_id=actor.id,
+            journal_id=journal.id,
+            new={
+                "document_type": document_type.value,
+                "document_number": document_number,
+                # A short one-way fingerprint supports audit correlation without
+                # exposing the bearer token itself in the audit log.
+                "token_fingerprint": hashlib.sha256(token.encode("utf-8")).hexdigest()[:12],
+            },
+        )
     return record
 
 
 def verification_url(token: str) -> str:
-    return f"{settings.public_base_url.rstrip('/')}/verify/{token}"
+    """Return the public, non-sensitive document verification URL encoded by QR codes."""
+    return f"{settings.normalized_public_base_url.rstrip('/')}/?{urlencode({'verify': token})}"
 
 
 def author_payment_url(token: str) -> str:
@@ -340,6 +369,54 @@ def _qr_image(url: str) -> Image:
     image.save(buffer, format="PNG")
     buffer.seek(0)
     return Image(buffer, width=30 * mm, height=30 * mm)
+
+
+def _verification_qr_block(url: str, label: str, styles) -> Table:
+    """Build a clearly labelled document-verification QR block.
+
+    The QR payload is only ``url``.  Human-readable document metadata and
+    verification tokens are intentionally not embedded in the QR payload.
+    """
+    return Table(
+        [
+            [_qr_image(url)],
+            [Paragraph(f"<b>{escape(label)}</b>", styles["JASMeta"])],
+        ],
+        colWidths=[35 * mm],
+        style=TableStyle(
+            [
+                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+                ("TOPPADDING", (0, 0), (-1, -1), 0),
+                ("BOTTOMPADDING", (0, 0), (-1, 0), 2),
+            ]
+        ),
+    )
+
+
+def _qris_payment_block(journal: Journal, styles):
+    """Return a payment-only QRIS block; never reuse it for verification."""
+    if not journal.qris_path or not Path(journal.qris_path).is_file():
+        return None
+    return Table(
+        [
+            [_optional_image(journal.qris_path, 35 * mm, 35 * mm)],
+            [Paragraph("<b>Scan to Pay</b>", styles["JASMeta"])],
+        ],
+        colWidths=[40 * mm],
+        style=TableStyle(
+            [
+                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+                ("TOPPADDING", (0, 0), (-1, -1), 0),
+                ("BOTTOMPADDING", (0, 0), (-1, 0), 2),
+            ]
+        ),
+    )
 
 
 def _styles():
@@ -439,6 +516,7 @@ def _loa_context(
         "loa_date": indonesian_date(printed_date) if journal.abbreviation.upper() == "ELKOLIND" else printed_date.isoformat(),
         "journal_url": journal.website or "",
         "journal_email": journal.contact_email or "",
+        "verification_qr": "",
     }
     context.update(overrides or {})
     return context
@@ -467,9 +545,12 @@ def _generate_template_loa(
         output_dir / f"{output_stem}.docx",
         values,
         output_pdf=output_dir / f"{output_stem}.pdf",
-        qr_url=(verification_url(verification_token or "DRAFT-NOT-ISSUED") if submission.journal.loa_qr_enabled else None),
+        # Preview documents have no persisted verification record and therefore
+        # must not contain a fake or refresh-dependent verification QR.
+        qr_url=(verification_url(verification_token) if submission.journal.loa_qr_enabled and verification_token else None),
         qr_size_mm=submission.journal.loa_qr_size_mm,
         qr_placement=submission.journal.loa_qr_placement,
+        qr_label="Scan to Verify LoA",
     )
 
 
@@ -558,11 +639,42 @@ def generate_invoice_pdf(invoice: Invoice) -> str:
             Spacer(1, 6 * mm),
             Paragraph(f"<b>Payment method</b>: {escape(invoice.payment_method or 'Contact journal administration')}", styles["JASBody"]),
             Paragraph(f"<b>Bank</b>: {escape(journal.bank_name or 'Not configured')}<br/><b>Account</b>: {escape(journal.bank_account or 'Not configured')}<br/><b>Holder</b>: {escape(journal.account_holder or 'Not configured')}", styles["JASBody"]),
-            _optional_image(journal.qris_path, 35 * mm, 35 * mm),
             Paragraph(f"<b>Payment instructions</b><br/>{escape(journal.invoice_template)}", styles["JASBody"]) if journal.invoice_template else Spacer(1, 1 * mm),
-            Table([[_qr_image(verification_url(invoice.verification.token)), Paragraph(f"Scan to verify this invoice.<br/><font size='8'>Verification code: {invoice.verification.token}</font>", styles["JASBody"])]], colWidths=[35 * mm, 125 * mm]),
         ]
     )
+    qris_block = _qris_payment_block(journal, styles)
+    verification_block = _verification_qr_block(
+        verification_url(invoice.verification.token),
+        "Scan to Verify Invoice",
+        styles,
+    )
+    if qris_block:
+        story.extend(
+            [
+                Table(
+                    [[qris_block, verification_block]],
+                    colWidths=[80 * mm, 80 * mm],
+                    style=TableStyle(
+                        [
+                            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                        ]
+                    ),
+                ),
+                Paragraph(
+                    "The payment QR and document-verification QR serve different purposes.",
+                    styles["JASMeta"],
+                ),
+            ]
+        )
+    else:
+        story.append(
+            Table(
+                [[verification_block, Paragraph("Use this QR to confirm that this invoice is registered in JAS.", styles["JASBody"])]],
+                colWidths=[40 * mm, 120 * mm],
+                style=TableStyle([("VALIGN", (0, 0), (-1, -1), "MIDDLE")]),
+            )
+        )
     return _build_pdf(settings.document_dir / f"invoice-{invoice.id}.pdf", story)
 
 
@@ -596,11 +708,15 @@ def generate_receipt_pdf(receipt: Receipt) -> str:
                     _optional_image(journal.signature_path, 40 * mm, 16 * mm),
                     _optional_image(journal.stamp_path, 22 * mm, 22 * mm),
                     Paragraph(f"Authorized by<br/><b>{escape(receipt.authorized_person)}</b>", styles["JASBody"]),
-                ], _qr_image(verification_url(receipt.verification.token))]],
+                ], _verification_qr_block(
+                    verification_url(receipt.verification.token),
+                    "Scan to Verify Receipt",
+                    styles,
+                )]],
                 colWidths=[125 * mm, 35 * mm],
                 style=TableStyle([("VALIGN", (0, 0), (-1, -1), "BOTTOM")]),
             ),
-            Paragraph(f"Verification code: {receipt.verification.token}", styles["JASMeta"]),
+            Paragraph("Use the verification QR to confirm that this receipt is registered in JAS.", styles["JASMeta"]),
         ]
     )
     return _build_pdf(settings.document_dir / f"receipt-{receipt.id}.pdf", story)
@@ -632,7 +748,7 @@ def issue_loa(
     issue_date = printed_date or date.today()
     issued_at = datetime.now(timezone.utc)
     number = next_document_number(session, submission.journal, DocumentType.LOA, issue_date)
-    verification = create_verification(session, document_type=DocumentType.LOA, journal=submission.journal, submission=submission, document_number=number, issue_date=issue_date)
+    verification = create_verification(session, document_type=DocumentType.LOA, journal=submission.journal, submission=submission, document_number=number, issue_date=issue_date, actor=user)
     loa = LoADocument(
         journal_id=submission.journal_id,
         submission_id=submission.id,
@@ -669,6 +785,19 @@ def issue_loa(
         valid.verification.document_status = DocumentStatus.SUPERSEDED
         log_audit(
             session,
+            action="VERIFICATION_DOCUMENT_SUPERSEDED",
+            object_type="document_verification",
+            object_id=valid.verification.id,
+            user_id=user.id,
+            journal_id=submission.journal_id,
+            previous={"status": "VALID"},
+            new={
+                "status": "SUPERSEDED",
+                "replacement_verification_id": str(verification.id),
+            },
+        )
+        log_audit(
+            session,
             action="LOA_REISSUED",
             object_type="loa",
             object_id=valid.id,
@@ -703,6 +832,16 @@ def revoke_loa(session: Session, loa: LoADocument, user: User) -> None:
         raise BusinessRuleError("Only a valid LoA can be revoked.")
     loa.status = LoAStatus.REVOKED
     loa.verification.document_status = DocumentStatus.REVOKED
+    log_audit(
+        session,
+        action="VERIFICATION_DOCUMENT_REVOKED",
+        object_type="document_verification",
+        object_id=loa.verification.id,
+        user_id=user.id,
+        journal_id=loa.journal_id,
+        previous={"status": "VALID"},
+        new={"status": "REVOKED"},
+    )
     log_audit(session, action="LOA_REVOKED", object_type="loa", object_id=loa.id, user_id=user.id, journal_id=loa.journal_id, previous={"status": "VALID"}, new={"status": "REVOKED"})
 
 
@@ -726,7 +865,7 @@ def issue_invoice(
         raise BusinessRuleError("Due date cannot be before the invoice date.")
     total = calculate_invoice_total(apc, discount, additional_charge)
     number = next_document_number(session, submission.journal, DocumentType.INVOICE, invoice_date)
-    verification = create_verification(session, document_type=DocumentType.INVOICE, journal=submission.journal, submission=submission, document_number=number, issue_date=invoice_date)
+    verification = create_verification(session, document_type=DocumentType.INVOICE, journal=submission.journal, submission=submission, document_number=number, issue_date=invoice_date, actor=user)
     raw_token = secrets.token_urlsafe(32)
     invoice = Invoice(
         journal_id=submission.journal_id,
@@ -762,6 +901,16 @@ def cancel_invoice(session: Session, invoice: Invoice, user: User) -> None:
     previous = invoice.status.value
     invoice.status = InvoiceStatus.CANCELLED
     invoice.verification.document_status = DocumentStatus.CANCELLED
+    log_audit(
+        session,
+        action="VERIFICATION_DOCUMENT_CANCELLED",
+        object_type="document_verification",
+        object_id=invoice.verification.id,
+        user_id=user.id,
+        journal_id=invoice.journal_id,
+        previous={"status": "VALID"},
+        new={"status": "CANCELLED"},
+    )
     log_audit(session, action="INVOICE_CANCELLED", object_type="invoice", object_id=invoice.id, user_id=user.id, journal_id=invoice.journal_id, previous={"status": previous}, new={"status": "CANCELLED"})
 
 
@@ -857,7 +1006,7 @@ def issue_receipt(session: Session, payment: Payment, user: User) -> Receipt:
         raise BusinessRuleError("A receipt already exists for this payment.")
     issue_date = date.today()
     number = next_document_number(session, journal, DocumentType.RECEIPT, issue_date)
-    verification = create_verification(session, document_type=DocumentType.RECEIPT, journal=journal, submission=payment.invoice.submission, document_number=number, issue_date=issue_date)
+    verification = create_verification(session, document_type=DocumentType.RECEIPT, journal=journal, submission=payment.invoice.submission, document_number=number, issue_date=issue_date, actor=user)
     receipt = Receipt(journal_id=journal.id, invoice_id=payment.invoice.id, payment_id=payment.id, verification_id=verification.id, receipt_number=number, issue_date=issue_date, amount=payment.amount_paid, authorized_person=user.display_name, created_by=user.id)
     session.add(receipt)
     session.flush()
@@ -868,10 +1017,9 @@ def issue_receipt(session: Session, payment: Payment, user: User) -> Receipt:
 
 
 def public_verification(session: Session, token: str) -> dict | None:
-    record = session.scalar(select(DocumentVerification).where(DocumentVerification.token == token))
-    if not record:
-        return None
-    return _verification_payload(record)
+    from services.public_verification import public_document_verification
+
+    return public_document_verification(session, token)
 
 
 def public_loa_verification_by_number(session: Session, document_number: str) -> dict | None:
@@ -883,19 +1031,7 @@ def public_loa_verification_by_number(session: Session, document_number: str) ->
         )
         .order_by(DocumentVerification.created_at.desc())
     )
-    return _verification_payload(record) if record else None
-
-
-def _verification_payload(record: DocumentVerification) -> dict:
-    return {
-        "document_type": record.document_type.value,
-        "journal": record.journal.name,
-        "document_number": record.document_number,
-        "article_title": record.submission.manuscript_title,
-        "author": record.submission.corresponding_author,
-        "issue_date": record.issue_date.isoformat(),
-        "document_status": record.document_status.value,
-    }
+    return public_verification(session, record.token) if record else None
 
 
 def global_submission_search(session: Session, journal_ids: list[uuid.UUID], query: str) -> list[Submission]:
