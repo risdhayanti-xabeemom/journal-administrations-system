@@ -26,6 +26,8 @@ from .enums import (
     Role,
     TemplateStatus,
 )
+from .revision import RevisionArtifact, RevisionComment, RevisionIntegrityCheck, RevisionJob, RevisionReviewFile
+from .article_revision import ArticleRevisionArtifact, ArticleRevisionJob
 
 __all__ = [
     "Base", "Journal", "User", "UserJournal", "Submission", "Author",
@@ -33,4 +35,6 @@ __all__ = [
     "DocumentVerification", "AuditLog", "SystemSetting", "DocumentStatus",
     "DocumentType", "EditorialStatus", "InvoiceStatus", "LoAStatus",
     "PaymentStatus", "PublicationStatus", "Role", "TemplateStatus",
+    "RevisionJob", "RevisionReviewFile", "RevisionComment", "RevisionArtifact", "RevisionIntegrityCheck",
+    "ArticleRevisionJob", "ArticleRevisionArtifact",
 ]

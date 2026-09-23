@@ -7,8 +7,11 @@ __pycache__/
 
 jas.db
 *.db
+*.db.bak
+backups/
 
 private_uploads/
 generated_documents/
 
 .pytest_cache/
+.test_revision_tmp_*/

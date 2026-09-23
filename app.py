@@ -74,6 +74,8 @@ from services.template_service import (
     upload_loa_template,
 )
 from services.database import SessionLocal, init_database
+from revision_page import quick_revision_page, revision_jobs_page, revision_history_page
+from article_revision_page import article_templates_panel, quick_template_revision_page, revision_jobs_hub, revision_history_hub
 from services.ojs_import import (
     FIELD_ALIASES,
     REQUIRED_FIELDS,
@@ -920,9 +922,14 @@ def users_page(session, journal: Journal, user: User) -> None:
 
 def templates_page(session, journal: Journal, user: User) -> None:
     st.title("Document templates")
-    if user.role != Role.SUPER_ADMIN:
-        st.warning("Only Super Admin can edit templates.")
+    if user.role not in {Role.SUPER_ADMIN, Role.JOURNAL_ADMIN}:
+        st.warning("Only Super Admin or Journal Admin can edit templates.")
         return
+    article_templates_panel(session, journal, user, show_pdf)
+    if user.role != Role.SUPER_ADMIN:
+        st.caption("LoA master template and invoice/receipt text remain restricted to Super Admin.")
+        return
+    st.divider()
     st.subheader("Letter of Acceptance Master Template")
     current = active_loa_template(session, journal.id)
     details = st.columns(3)
@@ -1110,6 +1117,10 @@ def main() -> None:
                     "SUBMISSIONS · Add Submission",
                     "SUBMISSIONS · Import CSV/Excel",
                     "SUBMISSIONS · Issue Monitor",
+                    "REVISION · Quick Template Revision",
+                    "REVISION · Reviewer Revision",
+                    "REVISION · Revision Jobs",
+                    "REVISION · Revision History",
                     "DOCUMENTS · Letter of Acceptance",
                     "DOCUMENTS · Invoices",
                     "DOCUMENTS · Receipts",
@@ -1121,14 +1132,20 @@ def main() -> None:
             if user.role == Role.SUPER_ADMIN:
                 pages += ["ADMINISTRATION · Journals", "ADMINISTRATION · Users", "ADMINISTRATION · Templates", "ADMINISTRATION · Audit Log"]
             elif user.role == Role.JOURNAL_ADMIN:
-                pages += ["ADMINISTRATION · Audit Log"]
-            page = st.sidebar.radio("Navigation", pages, label_visibility="collapsed")
+                pages += ["ADMINISTRATION · Templates", "ADMINISTRATION · Audit Log"]
+            if st.session_state.pop("revision_go_to_quick", False):
+                st.session_state.jas_navigation = "REVISION · Reviewer Revision"
+            page = st.sidebar.radio("Navigation", pages, label_visibility="collapsed", key="jas_navigation")
             renderers = {
                 "Dashboard": lambda: dashboard(session, journal),
                 "SUBMISSIONS · All Submissions": lambda: all_submissions(session, journal, user),
                 "SUBMISSIONS · Add Submission": lambda: add_submission(session, journal, user),
                 "SUBMISSIONS · Import CSV/Excel": lambda: import_submissions(session, journal, user),
                 "SUBMISSIONS · Issue Monitor": lambda: issue_monitor_page(session, journal),
+                "REVISION · Quick Template Revision": lambda: quick_template_revision_page(session, journal, user),
+                "REVISION · Reviewer Revision": lambda: quick_revision_page(session, journal, user),
+                "REVISION · Revision Jobs": lambda: revision_jobs_hub(session, journal, user),
+                "REVISION · Revision History": lambda: revision_history_hub(session, journal, user),
                 "DOCUMENTS · Letter of Acceptance": lambda: loa_page(session, journal, user),
                 "DOCUMENTS · Invoices": lambda: invoices_page(session, journal, user),
                 "DOCUMENTS · Receipts": lambda: receipts_page(session, journal, user),

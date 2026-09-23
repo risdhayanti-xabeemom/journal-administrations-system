@@ -32,7 +32,10 @@ def session_scope():
 
 def init_database() -> None:
     settings.prepare_directories()
-    Base.metadata.create_all(engine)
+    # Revision tables are installed only by the backed-up migration command.
+    legacy_tables = [table for table in Base.metadata.sorted_tables
+                     if not table.name.startswith(("revision_", "article_revision_"))]
+    Base.metadata.create_all(engine, tables=legacy_tables)
     with session_scope() as session:
         existing = set(session.scalars(select(Journal.abbreviation)))
         defaults = {
