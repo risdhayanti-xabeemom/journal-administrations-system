@@ -20,6 +20,7 @@ from config import settings
 from models import (
     AuditLog,
     Author,
+    DocumentVerification,
     DocumentTemplate,
     EditorialStatus,
     Invoice,
@@ -55,8 +56,6 @@ from services.core import (
     journals_for_user,
     log_audit,
     money,
-    public_verification,
-    public_loa_verification_by_number,
     reject_payment,
     revoke_loa,
     submit_payment,
@@ -64,7 +63,15 @@ from services.core import (
     update_editorial_status,
     update_publication_status,
     verify_payment,
+    verification_url,
 )
+from services.public_verification import (
+    public_amounts_enabled,
+    public_document_verification,
+    public_document_verification_by_number,
+    set_public_amount_visibility,
+)
+from services.verification_admin import generate_missing_verification_tokens, verification_qr_png
 from services.docx_templates import PDFConversionError, PDFConverterUnavailable, TemplateError
 from services.template_service import (
     activate_loa_template,
@@ -147,32 +154,44 @@ def route_token(kind: str) -> str | None:
 
 
 def render_verification(token: str) -> None:
-    st.markdown('<div class="jas-eyebrow">Public document verification</div>', unsafe_allow_html=True)
-    st.title("Journal Administration System")
-    with SessionLocal() as session:
-        data = public_verification(session, token)
-        if not data:
-            st.markdown('<div class="jas-invalid"><b>DOCUMENT NOT FOUND</b><br/>The verification token is invalid.</div>', unsafe_allow_html=True)
-            return
-        valid = data["document_status"] == "VALID"
-        css = "jas-valid" if valid else "jas-invalid"
-        heading = "DOCUMENT VALID" if valid else f'DOCUMENT {data["document_status"]}'
-        st.markdown(f'<div class="{css}"><b>{heading}</b></div>', unsafe_allow_html=True)
-        st.write("")
-        st.table(
-            pd.DataFrame(
-                [
-                    ("Document type", data["document_type"]),
-                    ("Journal", data["journal"]),
-                    ("Document number", data["document_number"]),
-                    ("Article title", data["article_title"]),
-                    ("Author", data["author"]),
-                    ("Issue date", data["issue_date"]),
-                    ("Document status", data["document_status"]),
-                ],
-                columns=["Field", "Value"],
-            ).set_index("Field")
+    st.markdown('<div class="jas-eyebrow">Journal Administration System</div>', unsafe_allow_html=True)
+    st.title("DOCUMENT VERIFICATION")
+    try:
+        with SessionLocal() as session:
+            data = public_document_verification(session, token)
+    except Exception:
+        data = None
+    if not data:
+        st.markdown(
+            '<div class="jas-invalid"><b>Document verification failed.</b><br/>'
+            'The verification code is invalid or the document is not registered in JAS.</div>',
+            unsafe_allow_html=True,
         )
+        return
+    valid = data["document_status"] == "VALID"
+    css = "jas-valid" if valid else "jas-invalid"
+    heading = "DOCUMENT VALID" if valid else f'DOCUMENT {data["document_status"]}'
+    st.markdown(f'<div class="{css}"><b>{heading}</b></div>', unsafe_allow_html=True)
+    rows = [
+        ("Document Type", {"LOA": "Letter of Acceptance", "INVOICE": "Invoice", "RECEIPT": "Receipt"}.get(data["document_type"], data["document_type"])),
+        ("Document Number", data["document_number"]),
+        ("Journal", data["journal"]),
+        ("Submission ID", data["submission_id"]),
+        ("Article Title", data["article_title"]),
+        ("Author / Corresponding Author", data["author"]),
+        ("Issue Date", data["issue_date"]),
+        ("Document Status", data["document_status"]),
+    ]
+    if data["document_type"] == "LOA":
+        rows.append(("LoA Status", data.get("loa_status") or "Not recorded"))
+        rows.append(("Acceptance Status", data.get("acceptance_status") or "Not recorded"))
+    elif data["document_type"] == "INVOICE":
+        rows.append(("Invoice Status", data.get("invoice_status") or "Not recorded"))
+    elif data["document_type"] == "RECEIPT" and data.get("payment_status"):
+        rows.append(("Payment Status", data["payment_status"]))
+    if data.get("amount"):
+        rows.append(("Amount", data["amount"]))
+    st.table(pd.DataFrame(rows, columns=["Field", "Value"]).set_index("Field"))
 
 
 def render_author_payment(token: str) -> None:
@@ -258,25 +277,31 @@ def render_login() -> None:
                     st.rerun()
                 st.error("Invalid email or password.")
         st.divider()
-        with st.expander("Verify a Letter of Acceptance by number"):
-            with st.form("public-loa-number-verification"):
-                lookup_number = st.text_input("LoA number")
-                lookup = st.form_submit_button("Verify LoA")
+        with st.expander("Verify Document"):
+            with st.form("public-document-number-verification"):
+                lookup_number = st.text_input("Document Number", placeholder="058/SK/ELK/VIII/2026")
+                lookup = st.form_submit_button("Verify Document")
             if lookup:
-                with SessionLocal() as session:
-                    data = public_loa_verification_by_number(session, lookup_number)
+                try:
+                    with SessionLocal() as session:
+                        data = public_document_verification_by_number(session, lookup_number)
+                except Exception:
+                    data = None
                 if not data:
-                    st.error("LoA number not found.")
+                    st.error("Document verification failed. The document number is invalid or is not registered in JAS.")
                 else:
                     valid = data["document_status"] == "VALID"
                     st.success("DOCUMENT VALID") if valid else st.error(f'DOCUMENT {data["document_status"]}')
                     st.table(pd.DataFrame([
+                        ("Document type", data["document_type"]),
                         ("Journal", data["journal"]),
                         ("Document number", data["document_number"]),
+                        ("Submission ID", data["submission_id"]),
                         ("Article title", data["article_title"]),
                         ("Author", data["author"]),
                         ("Issue date", data["issue_date"]),
                         ("Status", data["document_status"]),
+                        *([("Amount", data["amount"])] if data.get("amount") else []),
                     ], columns=["Field", "Value"]).set_index("Field"))
 
 
@@ -823,6 +848,7 @@ def journals_page(session, selected: Journal, user: User) -> None:
         st.warning("Only Super Admin can edit journal configuration.")
         return
     active_template = active_loa_template(session, selected.id)
+    public_amount_visibility = public_amounts_enabled(session, selected.id)
     with st.form("journal-settings"):
         name = st.text_input("Journal name", value=selected.name)
         abbreviation = st.text_input("Abbreviation", value=selected.abbreviation)
@@ -844,6 +870,11 @@ def journals_page(session, selected: Journal, user: User) -> None:
         qr_enabled = st.checkbox("Verification QR on LoA", value=selected.loa_qr_enabled)
         qr_placement = st.selectbox("LoA QR placement", ["template-placeholder", "bottom-right", "bottom-left", "top-right", "top-left"], index=["template-placeholder", "bottom-right", "bottom-left", "top-right", "top-left"].index(selected.loa_qr_placement if selected.loa_qr_placement in {"template-placeholder", "bottom-right", "bottom-left", "top-right", "top-left"} else "bottom-right"), disabled=not qr_enabled, help="Use template-placeholder for the safest layout. Corner placement is absolute and must be checked in preview so it never covers text, signatures, stamps, or logos.")
         qr_size = st.number_input("LoA QR size (mm)", min_value=10, max_value=40, value=selected.loa_qr_size_mm, disabled=not qr_enabled)
+        show_public_amounts = st.checkbox(
+            "Show invoice/receipt amount on public verification page",
+            value=public_amount_visibility,
+            help="Off by default. Email, bank details, payment proof, and internal notes are never exposed.",
+        )
         invoice_format = st.text_input("Invoice numbering pattern", value=selected.invoice_number_format)
         receipt_format = st.text_input("Receipt numbering pattern", value=selected.receipt_number_format)
         st.subheader("Publication Settings")
@@ -869,6 +900,7 @@ def journals_page(session, selected: Journal, user: User) -> None:
         selected.bank_name, selected.bank_account, selected.account_holder = bank or None, account or None, holder or None
         selected.loa_number_format, selected.invoice_number_format, selected.receipt_number_format = loa_format, invoice_format, receipt_format
         selected.loa_qr_enabled, selected.loa_qr_placement, selected.loa_qr_size_mm = qr_enabled, qr_placement, int(qr_size)
+        set_public_amount_visibility(session, selected.id, show_public_amounts)
         selected.default_volume, selected.default_issue = default_volume or None, default_issue or None
         selected.default_publication_month, selected.default_publication_year = default_month or None, int(default_year) or None
         for upload, attribute in [
@@ -879,7 +911,7 @@ def journals_page(session, selected: Journal, user: User) -> None:
         ]:
             if upload is not None:
                 setattr(selected, attribute, store_private_upload(upload.name, upload.getvalue()))
-        log_audit(session, action="JOURNAL_SETTINGS_CHANGED", object_type="journal", object_id=selected.id, user_id=user.id, journal_id=selected.id, previous=before, new={"name": selected.name, "abbreviation": selected.abbreviation})
+        log_audit(session, action="JOURNAL_SETTINGS_CHANGED", object_type="journal", object_id=selected.id, user_id=user.id, journal_id=selected.id, previous=before, new={"name": selected.name, "abbreviation": selected.abbreviation, "public_verification_show_amount": show_public_amounts})
         try:
             session.commit()
             st.success("Journal settings saved.")
@@ -1043,7 +1075,77 @@ def audit_page(session, journal: Journal) -> None:
     st.dataframe(pd.DataFrame([{"Timestamp": x.created_at, "Action": x.action, "Object": f"{x.object_type}:{x.object_id}", "User ID": str(x.user_id or "System"), "Previous": x.previous_value, "New": x.new_value} for x in logs]), use_container_width=True, hide_index=True)
 
 
+def document_verification_page(session, journal: Journal, user: User) -> None:
+    st.title("Document Verification")
+    st.caption("Verification links identify documents issued by JAS. Payment QRIS remains a separate payment function.")
+    if user.role in {Role.SUPER_ADMIN, Role.JOURNAL_ADMIN}:
+        if st.button("Generate Missing Verification Token"):
+            try:
+                repaired = generate_missing_verification_tokens(
+                    session,
+                    journal=journal,
+                    user=user,
+                )
+                session.commit()
+                if repaired:
+                    st.success(f"Generated {len(repaired)} missing verification token(s). Existing tokens were unchanged.")
+                    st.rerun()
+                else:
+                    st.info("No missing verification tokens were found. Existing tokens were unchanged.")
+            except Exception as exc:
+                session.rollback()
+                notice_error(exc)
+    records = list(
+        session.scalars(
+            select(DocumentVerification)
+            .where(DocumentVerification.journal_id == journal.id)
+            .order_by(DocumentVerification.created_at.desc())
+        )
+    )
+    if not records:
+        st.info("No verification records are registered for this journal yet.")
+        return
+    rows = []
+    for record in records:
+        configured = bool((record.token or "").strip())
+        rows.append(
+            {
+                "Document": record.document_type.value,
+                "Document Number": record.document_number,
+                "Verification Token Status": "CONFIGURED" if configured else "MISSING",
+                "Verification URL": verification_url(record.token) if configured else "Not available",
+                "Document Status": record.document_status.value,
+            }
+        )
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    selected_id = st.selectbox(
+        "Document",
+        [str(record.id) for record in records],
+        format_func=lambda value: next(
+            f"{record.document_type.value} · {record.document_number} · {record.document_status.value}"
+            for record in records
+            if str(record.id) == value
+        ),
+        key=f"verification-record-{journal.id}",
+    )
+    selected = next(record for record in records if str(record.id) == selected_id)
+    if not (selected.token or "").strip():
+        st.warning("This legacy document does not have a verification token. Use Generate Missing Verification Token above.")
+        return
+    public_url = verification_url(selected.token)
+    st.markdown("**Copy Verification URL**")
+    st.code(public_url, language=None)
+    st.link_button("Open Verification Page", public_url)
+    st.download_button(
+        "Regenerate QR Image",
+        data=verification_qr_png(public_url),
+        file_name=f"verify-{selected.document_type.value.lower()}-{selected.id}.png",
+        mime="image/png",
+    )
+
+
 def main() -> None:
+    public_url_warnings = settings.public_base_url_warnings()
     init_database()
     with SessionLocal() as bootstrap_session:
         if bootstrap_admin(bootstrap_session):
@@ -1124,6 +1226,7 @@ def main() -> None:
                     "DOCUMENTS · Letter of Acceptance",
                     "DOCUMENTS · Invoices",
                     "DOCUMENTS · Receipts",
+                    "DOCUMENTS · Verification",
                     "FINANCE · Payment Verification",
                     "FINANCE · Financial Report",
                     "PUBLICATION · Publication Tracking",
@@ -1149,6 +1252,7 @@ def main() -> None:
                 "DOCUMENTS · Letter of Acceptance": lambda: loa_page(session, journal, user),
                 "DOCUMENTS · Invoices": lambda: invoices_page(session, journal, user),
                 "DOCUMENTS · Receipts": lambda: receipts_page(session, journal, user),
+                "DOCUMENTS · Verification": lambda: document_verification_page(session, journal, user),
                 "FINANCE · Payment Verification": lambda: payment_verification_page(session, journal, user),
                 "FINANCE · Financial Report": lambda: reports_page(session, journal),
                 "PUBLICATION · Publication Tracking": lambda: publication_page(session, journal, user),
@@ -1160,6 +1264,9 @@ def main() -> None:
             }
             renderers[page]()
         st.sidebar.divider()
+        if user.role in {Role.SUPER_ADMIN, Role.JOURNAL_ADMIN}:
+            for warning in public_url_warnings:
+                st.sidebar.warning(warning)
         if settings.is_development_database:
             st.sidebar.warning("Development database: SQLite. Set DATABASE_URL to PostgreSQL for production.")
         if st.sidebar.button("Sign out", use_container_width=True):

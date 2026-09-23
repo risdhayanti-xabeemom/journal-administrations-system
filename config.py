@@ -3,9 +3,61 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 
 BASE_DIR = Path(__file__).resolve().parent
+
+
+_LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
+
+
+def normalize_public_base_url(value: str) -> str:
+    """Return a stable origin/path and discard unsafe query/fragment suffixes."""
+    candidate = (value or "").strip()
+    if not candidate:
+        return ""
+    parsed = urlsplit(candidate)
+    path = parsed.path.rstrip("/")
+    return urlunsplit((parsed.scheme.lower(), parsed.netloc, path, "", ""))
+
+
+def streamlit_cloud_detected() -> bool:
+    """Detect common Streamlit Community Cloud runtime markers conservatively."""
+    explicit = (
+        os.getenv("STREAMLIT_CLOUD"),
+        os.getenv("STREAMLIT_SHARING_MODE"),
+        os.getenv("STREAMLIT_RUNTIME_ENV"),
+    )
+    return any(
+        (value or "").strip().lower() in {"1", "true", "yes", "cloud", "streamlit", "community_cloud"}
+        for value in explicit
+    ) or Path("/mount/src").is_dir()
+
+
+def validate_public_base_url(value: str, *, production: bool = False) -> tuple[str, ...]:
+    """Validate the public origin used in document-verification QR links.
+
+    The validator reports configuration warnings rather than raising so a bad QR
+    origin cannot make the rest of JAS unavailable.
+    """
+    raw = (value or "").strip()
+    candidate = normalize_public_base_url(raw)
+    parsed = urlsplit(candidate)
+    raw_parsed = urlsplit(raw)
+    warnings: list[str] = []
+    if not candidate or parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ("PUBLIC_BASE_URL must be an absolute HTTP(S) URL.",)
+    if parsed.username or parsed.password:
+        warnings.append("PUBLIC_BASE_URL must not contain embedded credentials.")
+    if raw_parsed.query or raw_parsed.fragment:
+        warnings.append("PUBLIC_BASE_URL must not contain query parameters or a fragment.")
+    hostname = (parsed.hostname or "").lower()
+    if production and parsed.scheme != "https":
+        warnings.append("PUBLIC_BASE_URL must use HTTPS in production.")
+    if production and hostname in _LOCAL_HOSTS:
+        warnings.append("PUBLIC_BASE_URL is not configured for production. QR verification links will be invalid.")
+    return tuple(warnings)
 
 
 def _secret(name: str, default: str | None = None) -> str | None:
@@ -53,6 +105,13 @@ class Settings:
     @property
     def is_development_database(self) -> bool:
         return self.database_url.startswith("sqlite:")
+
+    @property
+    def normalized_public_base_url(self) -> str:
+        return normalize_public_base_url(self.public_base_url)
+
+    def public_base_url_warnings(self) -> tuple[str, ...]:
+        return validate_public_base_url(self.public_base_url, production=streamlit_cloud_detected())
 
     def prepare_directories(self) -> None:
         self.upload_dir.mkdir(parents=True, exist_ok=True)

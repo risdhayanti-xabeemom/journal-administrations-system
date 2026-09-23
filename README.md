@@ -88,7 +88,7 @@ Salin `.env.example` ke `.env` untuk Docker Compose, atau `.streamlit/secrets.to
 | Variable | Tujuan |
 |---|---|
 | `DATABASE_URL` | URL PostgreSQL SQLAlchemy; SQLite hanya fallback lokal |
-| `PUBLIC_BASE_URL` | basis URL untuk QR dan tautan publik |
+| `PUBLIC_BASE_URL` | URL absolut JAS untuk QR dan tautan publik; gunakan HTTPS pada production, tanpa query/fragment |
 | `ADMIN_EMAIL` | email bootstrap Super Admin |
 | `ADMIN_PASSWORD` | password bootstrap minimal 12 karakter; hapus setelah akun dibuat |
 | `ADMIN_NAME` | nama Super Admin |
@@ -137,12 +137,13 @@ PDF dan bukti bayar berada di named volume `jas_files`; database berada di `jas_
 
 ## Tautan publik
 
-QR dokumen menghasilkan `/verify/{token}` dan tautan pembayaran menghasilkan `/payment/{token}`. Pada deployment Streamlit, reverse proxy harus meneruskan kedua path tersebut ke aplikasi tanpa menghapus path. Query fallback juga didukung:
+QR verifikasi LoA, invoice, dan receipt selalu berisi URL absolut `{{PUBLIC_BASE_URL}}/?verify={{token}}`. Tautan konfirmasi pembayaran author tetap terpisah pada `/payment/{token}` (query fallback `/?payment_token={token}`). QRIS invoice juga merupakan QR pembayaran terpisah dengan label **Scan to Pay** dan tidak pernah dipakai sebagai QR verifikasi dokumen.
 
-- `/?verify={token}`
-- `/?payment_token={token}`
+Pada Streamlit Cloud, isi misalnya `PUBLIC_BASE_URL = "https://jasv1-journal.streamlit.app"` di Secrets. Aplikasi memberi peringatan admin bila deployment cloud masih menggunakan localhost, HTTP, atau nilai dengan query/fragment, tetapi fitur JAS lain tetap dapat digunakan.
 
-Halaman verifikasi hanya menampilkan jenis/nomor/status dokumen, jurnal, judul, penulis, dan tanggal. Email, detail bank, nilai pembayaran, serta bukti unggahan tidak ditampilkan.
+`DOCUMENTS · Verification` menampilkan status token, URL publik, status dokumen, tautan buka halaman, dan unduhan ulang gambar QR tanpa mengganti token. Tombol **Generate Missing Verification Token** hanya memperbaiki dokumen legacy yang belum memiliki token, mempertahankan token yang sudah ada, dan mencatat fingerprint token dalam audit log.
+
+Halaman publik hanya menampilkan jenis/nomor/status dokumen, jurnal, Submission ID, judul, penulis, dan tanggal. Receipt juga menampilkan status pembayaran, sedangkan invoice dan LoA menampilkan status masing-masing. Nilai invoice/receipt tersembunyi secara default dan hanya tampil jika Super Admin mengaktifkannya untuk jurnal tersebut. Email, detail bank, bukti unggahan, catatan admin, path storage, dan identifier internal tidak pernah ditampilkan.
 
 Raw token pembayaran hanya ditampilkan satu kali ketika invoice diterbitkan; database hanya menyimpan SHA-256 hash dan waktu kedaluwarsa. Jika tautan hilang, invoice perlu dibatalkan dan diterbitkan ulang pada versi berikutnya (fitur rotasi token terpisah dapat ditambahkan dengan audit trail).
 
@@ -152,7 +153,7 @@ Raw token pembayaran hanya ditampilkan satu kali ketika invoice diterbitkan; dat
 pytest -q
 ```
 
-Tes mencakup hashing password, format Rupiah, upload/versioning/activation Master DOCX, replacement ELKOLIND dan JASENS beserta identitas Editor-in-Chief statis, bulan Romawi IX–XII dan rollover tahun, preview tanpa konsumsi nomor, state transition, lifecycle LoA–invoice–payment–receipt, serta alias/pemetaan/impor parsial CSV-XLSX OJS pada SQLite terisolasi.
+Tes mencakup hashing password, format Rupiah, upload/versioning/activation Master DOCX, replacement ELKOLIND dan JASENS beserta identitas Editor-in-Chief statis, bulan Romawi IX–XII dan rollover tahun, preview tanpa konsumsi nomor, state transition, lifecycle LoA–invoice–payment–receipt, URL/token/status/privacy verifikasi, pemisahan QRIS dan QR verifikasi, serta alias/pemetaan/impor parsial CSV-XLSX OJS pada SQLite terisolasi.
 
 ## Quick Manuscript Template Revision
 
