@@ -977,12 +977,155 @@ def verify_payment(session: Session, payment: Payment, user: User, internal_note
     assert_journal_access(user, payment.invoice.journal_id, {Role.SUPER_ADMIN, Role.JOURNAL_ADMIN, Role.FINANCE}, session)
     if payment.status != PaymentStatus.SUBMITTED:
         raise BusinessRuleError("Only a submitted payment can be verified.")
+    invoice = session.scalar(select(Invoice).where(Invoice.id == payment.invoice_id).with_for_update())
+    if invoice is None:
+        raise BusinessRuleError("The related invoice no longer exists.")
+    duplicate = session.scalar(
+        select(Payment).where(
+            Payment.invoice_id == invoice.id,
+            Payment.status == PaymentStatus.VERIFIED,
+            Payment.id != payment.id,
+        )
+    )
+    if duplicate or invoice.status == InvoiceStatus.PAID:
+        raise BusinessRuleError("This invoice has already been paid and verified.")
+    if invoice.status == InvoiceStatus.CANCELLED:
+        raise BusinessRuleError("A cancelled invoice cannot receive a verified payment.")
+    previous_invoice_status = invoice.status.value
     payment.status = PaymentStatus.VERIFIED
     payment.internal_notes = internal_notes
     payment.verified_at = datetime.now(timezone.utc)
     payment.verified_by = user.id
-    payment.invoice.status = InvoiceStatus.PAID
-    log_audit(session, action="PAYMENT_VERIFIED", object_type="payment", object_id=payment.id, user_id=user.id, journal_id=payment.invoice.journal_id, previous={"status": "SUBMITTED"}, new={"status": "VERIFIED"})
+    invoice.status = InvoiceStatus.PAID
+    payment.invoice = invoice
+    log_audit(session, action="PAYMENT_VERIFIED", object_type="payment", object_id=payment.id, user_id=user.id, journal_id=invoice.journal_id, previous={"status": "SUBMITTED"}, new={"status": "VERIFIED"})
+    log_audit(
+        session,
+        action="INVOICE_MARKED_PAID",
+        object_type="invoice",
+        object_id=invoice.id,
+        user_id=user.id,
+        journal_id=invoice.journal_id,
+        previous={"status": previous_invoice_status},
+        new={"status": "PAID", "payment_id": str(payment.id)},
+    )
+
+
+def record_manual_payment(
+    session: Session,
+    invoice: Invoice,
+    user: User,
+    *,
+    payment_date: date,
+    payment_method: str,
+    amount_paid: Decimal,
+    payment_reference: str | None = None,
+    notes: str | None = None,
+    upload_name: str | None = None,
+    upload_content: bytes | None = None,
+    confirm_underpayment: bool = False,
+) -> Payment:
+    """Record and immediately verify a payment received by the editorial team."""
+    assert_journal_access(
+        user,
+        invoice.journal_id,
+        {Role.SUPER_ADMIN, Role.JOURNAL_ADMIN, Role.FINANCE},
+        session,
+    )
+    locked_invoice = session.scalar(select(Invoice).where(Invoice.id == invoice.id).with_for_update())
+    if locked_invoice is None:
+        raise BusinessRuleError("The selected invoice no longer exists.")
+    verified = session.scalar(
+        select(Payment).where(
+            Payment.invoice_id == locked_invoice.id,
+            Payment.status == PaymentStatus.VERIFIED,
+        )
+    )
+    if verified or locked_invoice.status == InvoiceStatus.PAID:
+        raise BusinessRuleError("This invoice has already been paid and verified.")
+    pending = session.scalar(
+        select(Payment).where(
+            Payment.invoice_id == locked_invoice.id,
+            Payment.status == PaymentStatus.SUBMITTED,
+        )
+    )
+    if pending:
+        raise BusinessRuleError("This invoice already has a payment confirmation awaiting verification.")
+    if locked_invoice.status == InvoiceStatus.CANCELLED:
+        raise BusinessRuleError("A cancelled invoice cannot receive a payment.")
+    if locked_invoice.status not in {InvoiceStatus.ISSUED, InvoiceStatus.WAITING_PAYMENT}:
+        raise BusinessRuleError("Only an issued or unpaid invoice can be recorded as paid manually.")
+
+    method = (payment_method or "").strip()
+    if not method:
+        raise BusinessRuleError("Payment method is required.")
+    if len(method) > 255:
+        raise BusinessRuleError("Payment method must be 255 characters or fewer.")
+    if not isinstance(payment_date, date):
+        raise BusinessRuleError("Payment date is required.")
+    if payment_date > date.today():
+        raise BusinessRuleError("Payment date cannot be in the future.")
+    amount = Decimal(amount_paid)
+    if amount <= 0:
+        raise BusinessRuleError("Amount received must be greater than zero.")
+    invoice_amount = Decimal(locked_invoice.total_amount)
+    if amount < invoice_amount and not confirm_underpayment:
+        raise BusinessRuleError(
+            "Amount received is lower than invoice amount. Explicit confirmation is required before marking it paid."
+        )
+    clean_notes = (notes or "").strip()
+    if amount > invoice_amount and not clean_notes:
+        raise BusinessRuleError("Amount received is higher than invoice amount. Add a payment note before continuing.")
+
+    if bool(upload_name) != bool(upload_content):
+        raise BusinessRuleError("Payment proof filename and content must be provided together.")
+    proof_path = ""
+    proof_original_name = ""
+    if upload_name and upload_content:
+        proof_path = store_private_upload(upload_name, upload_content)
+        proof_original_name = Path(upload_name).name[:255]
+
+    reference = (payment_reference or "").strip()
+    internal_parts = []
+    if reference:
+        internal_parts.append(f"Payment reference: {reference}")
+    if clean_notes:
+        internal_parts.append(f"Payment notes: {clean_notes}")
+    internal_notes = "\n".join(internal_parts) or None
+
+    payment = Payment(
+        invoice_id=locked_invoice.id,
+        payer_name=locked_invoice.submission.corresponding_author,
+        payment_method=method,
+        payment_date=payment_date,
+        amount_paid=amount,
+        proof_path=proof_path,
+        proof_original_name=proof_original_name,
+        author_notes=None,
+        internal_notes=internal_notes,
+        status=PaymentStatus.SUBMITTED,
+    )
+    session.add(payment)
+    session.flush()
+    payment.invoice = locked_invoice
+    log_audit(
+        session,
+        action="PAYMENT_RECORDED",
+        object_type="payment",
+        object_id=payment.id,
+        user_id=user.id,
+        journal_id=locked_invoice.journal_id,
+        new={
+            "invoice": locked_invoice.invoice_number,
+            "amount": str(amount),
+            "payment_date": payment_date.isoformat(),
+            "method": method,
+            "reference_recorded": bool(reference),
+            "proof_recorded": bool(proof_path),
+        },
+    )
+    verify_payment(session, payment, user, internal_notes)
+    return payment
 
 
 def reject_payment(session: Session, payment: Payment, user: User, internal_notes: str) -> None:
@@ -1013,6 +1156,7 @@ def issue_receipt(session: Session, payment: Payment, user: User) -> Receipt:
     receipt.journal, receipt.invoice, receipt.payment, receipt.verification = journal, payment.invoice, payment, verification
     receipt.pdf_path = generate_receipt_pdf(receipt)
     log_audit(session, action="RECEIPT_ISSUED", object_type="receipt", object_id=receipt.id, user_id=user.id, journal_id=journal.id, new={"number": number, "amount": str(receipt.amount)})
+    log_audit(session, action="RECEIPT_GENERATED", object_type="receipt", object_id=receipt.id, user_id=user.id, journal_id=journal.id, new={"number": number, "payment_id": str(payment.id)})
     return receipt
 
 

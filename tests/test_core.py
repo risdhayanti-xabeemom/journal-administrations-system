@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+from dataclasses import replace
 from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -23,15 +24,15 @@ from sqlalchemy.orm import Session
 import services.core as core
 from config import settings
 from models import (
-    Author, Base, DocumentSequence, DocumentTemplate, DocumentType, EditorialStatus,
-    InvoiceStatus, Journal, LoAStatus, PaymentStatus, PublicationStatus, Role,
+    AuditLog, Author, Base, DocumentSequence, DocumentTemplate, DocumentType, EditorialStatus,
+    InvoiceStatus, Journal, LoAStatus, Payment, PaymentStatus, PublicationStatus, Receipt, Role,
     Submission, TemplateStatus, User,
 )
 from services.core import (
     BusinessRuleError, calculate_invoice_total, export_workbook, generate_loa_preview,
     hash_password, issue_invoice, issue_loa, issue_receipt, money,
     next_document_number, public_loa_verification_by_number, public_verification, submit_payment,
-    update_editorial_status, update_publication_status, validate_payment_upload,
+    record_manual_payment, update_editorial_status, update_publication_status, validate_payment_upload,
     verify_password, verify_payment,
 )
 from services.docx_templates import GeneratedLoA, extract_placeholders, generate_from_template
@@ -272,3 +273,218 @@ def test_complete_document_and_payment_lifecycle(session, records, fake_loa_rend
     assert os.path.isfile(receipt.pdf_path)
     assert public_verification(session, receipt.verification.token)["document_type"] == "RECEIPT"
     assert export_workbook(session, [submission.journal_id]).startswith(b"PK")
+
+
+def _issued_invoice(session, records):
+    _, user, submission = records
+    invoice, _ = issue_invoice(
+        session,
+        submission,
+        user,
+        due_date=date.today() + timedelta(days=14),
+        apc=Decimal("1000000"),
+        discount=Decimal("0"),
+        additional_charge=Decimal("0"),
+        payment_method="Bank transfer",
+        notes=None,
+    )
+    session.commit()
+    return user, invoice
+
+
+def test_manual_payment_verifies_invoice_and_generates_receipt(session, records):
+    user, invoice = _issued_invoice(session, records)
+    payment = record_manual_payment(
+        session,
+        invoice,
+        user,
+        payment_date=date.today(),
+        payment_method="QRIS",
+        payment_reference="TRX-2026-0042",
+        amount_paid=invoice.total_amount,
+        notes="Received by editorial office.",
+    )
+    session.commit()
+
+    assert payment.status == PaymentStatus.VERIFIED
+    assert payment.verified_by == user.id and payment.verified_at is not None
+    assert payment.proof_path == "" and payment.proof_original_name == ""
+    assert invoice.status == InvoiceStatus.PAID
+    assert "TRX-2026-0042" in (payment.internal_notes or "")
+
+    receipt = issue_receipt(session, payment, user)
+    session.commit()
+    assert receipt.payment_id == payment.id
+    assert receipt.invoice_id == invoice.id
+    assert receipt.amount == payment.amount_paid
+    assert receipt.verification.token
+    assert Path(receipt.pdf_path).is_file()
+    actions = set(
+        session.scalars(
+            select(AuditLog.action).where(
+                AuditLog.action.in_(
+                    {
+                        "PAYMENT_RECORDED",
+                        "PAYMENT_VERIFIED",
+                        "INVOICE_MARKED_PAID",
+                        "RECEIPT_GENERATED",
+                    }
+                )
+            )
+        )
+    )
+    assert actions == {
+        "PAYMENT_RECORDED",
+        "PAYMENT_VERIFIED",
+        "INVOICE_MARKED_PAID",
+        "RECEIPT_GENERATED",
+    }
+
+
+def test_manual_payment_prevents_duplicate_verified_payment(session, records):
+    user, invoice = _issued_invoice(session, records)
+    record_manual_payment(
+        session,
+        invoice,
+        user,
+        payment_date=date.today(),
+        payment_method="Cash",
+        amount_paid=invoice.total_amount,
+    )
+    session.commit()
+
+    with pytest.raises(BusinessRuleError, match="already been paid and verified"):
+        record_manual_payment(
+            session,
+            invoice,
+            user,
+            payment_date=date.today(),
+            payment_method="Cash",
+            amount_paid=invoice.total_amount,
+        )
+    assert session.scalar(
+        select(func.count()).select_from(Payment).where(
+            Payment.invoice_id == invoice.id,
+            Payment.status == PaymentStatus.VERIFIED,
+        )
+    ) == 1
+
+
+def test_manual_payment_does_not_bypass_pending_author_confirmation(session, records):
+    user, invoice = _issued_invoice(session, records)
+    submit_payment(
+        session,
+        invoice,
+        payer_name="A. Author",
+        payment_method="Bank Transfer",
+        payment_date=date.today(),
+        amount_paid=invoice.total_amount,
+        upload_name="proof.pdf",
+        upload_content=b"%PDF-1.7\npending proof",
+        notes=None,
+    )
+    # Even if legacy data has a stale invoice status, the pending payment record
+    # remains authoritative and must be reviewed instead of duplicated.
+    invoice.status = InvoiceStatus.WAITING_PAYMENT
+    session.flush()
+
+    with pytest.raises(BusinessRuleError, match="awaiting verification"):
+        record_manual_payment(
+            session,
+            invoice,
+            user,
+            payment_date=date.today(),
+            payment_method="Bank Transfer",
+            amount_paid=invoice.total_amount,
+        )
+    assert session.scalar(
+        select(func.count()).select_from(Payment).where(Payment.invoice_id == invoice.id)
+    ) == 1
+
+
+def test_manual_underpayment_requires_explicit_confirmation(session, records):
+    user, invoice = _issued_invoice(session, records)
+    with pytest.raises(BusinessRuleError, match="lower than invoice amount"):
+        record_manual_payment(
+            session,
+            invoice,
+            user,
+            payment_date=date.today(),
+            payment_method="Bank Transfer",
+            amount_paid=Decimal("900000"),
+        )
+    session.rollback()
+
+    payment = record_manual_payment(
+        session,
+        invoice,
+        user,
+        payment_date=date.today(),
+        payment_method="Bank Transfer",
+        amount_paid=Decimal("900000"),
+        notes="Approved partial settlement.",
+        confirm_underpayment=True,
+    )
+    session.commit()
+    assert payment.status == PaymentStatus.VERIFIED
+    assert invoice.total_amount == Decimal("1000000")
+    assert invoice.status == InvoiceStatus.PAID
+
+
+def test_manual_overpayment_requires_note_and_preserves_invoice_amount(session, records):
+    user, invoice = _issued_invoice(session, records)
+    with pytest.raises(BusinessRuleError, match="higher than invoice amount"):
+        record_manual_payment(
+            session,
+            invoice,
+            user,
+            payment_date=date.today(),
+            payment_method="Bank Transfer",
+            amount_paid=Decimal("1100000"),
+        )
+    session.rollback()
+
+    payment = record_manual_payment(
+        session,
+        invoice,
+        user,
+        payment_date=date.today(),
+        payment_method="Bank Transfer",
+        amount_paid=Decimal("1100000"),
+        notes="Overpayment acknowledged; follow-up recorded separately.",
+    )
+    session.commit()
+    assert payment.amount_paid == Decimal("1100000")
+    assert invoice.total_amount == Decimal("1000000")
+    assert invoice.status == InvoiceStatus.PAID
+
+
+def test_manual_payment_optional_proof_uses_private_randomized_storage(
+    session, records, tmp_path, monkeypatch
+):
+    user, invoice = _issued_invoice(session, records)
+    private_dir = tmp_path / "private-payments"
+    monkeypatch.setattr(core, "settings", replace(core.settings, upload_dir=private_dir))
+    proof = b"%PDF-1.7\nmanual payment proof"
+
+    payment = record_manual_payment(
+        session,
+        invoice,
+        user,
+        payment_date=date.today(),
+        payment_method="Bank Transfer",
+        amount_paid=invoice.total_amount,
+        upload_name="bank-statement.pdf",
+        upload_content=proof,
+    )
+    session.commit()
+
+    stored = Path(payment.proof_path)
+    assert stored.parent == private_dir
+    assert stored.name != "bank-statement.pdf"
+    assert stored.read_bytes() == proof
+    assert payment.proof_original_name == "bank-statement.pdf"
+    audit = session.scalar(
+        select(AuditLog).where(AuditLog.action == "PAYMENT_RECORDED")
+    )
+    assert proof.decode("latin-1") not in (audit.new_value or "")

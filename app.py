@@ -56,6 +56,7 @@ from services.core import (
     journals_for_user,
     log_audit,
     money,
+    record_manual_payment,
     reject_payment,
     revoke_loa,
     submit_payment,
@@ -714,38 +715,406 @@ def invoices_page(session, journal: Journal, user: User) -> None:
 
 def payment_verification_page(session, journal: Journal, user: User) -> None:
     st.title("Payment verification")
-    payments = list(session.scalars(select(Payment).join(Invoice).where(Invoice.journal_id == journal.id).order_by(Payment.submitted_at.desc())))
-    if not payments:
-        st.info("No payment confirmations yet.")
-        return
-    for payment in payments:
+
+    success = st.session_state.pop("manual_payment_success", None)
+    if success:
+        st.success(success["message"])
+        if success.get("receipt_id"):
+            receipt = session.get(Receipt, uuid.UUID(success["receipt_id"]))
+            if receipt and receipt.pdf_path and Path(receipt.pdf_path).is_file():
+                st.download_button(
+                    "Download Receipt",
+                    Path(receipt.pdf_path).read_bytes(),
+                    file_name=f"{receipt.receipt_number.replace('/', '-')}.pdf",
+                    mime="application/pdf",
+                    key=f"manual-success-receipt-{receipt.id}",
+                )
+        elif success.get("payment_id") and st.button("Create Receipt", type="primary", key="manual-success-create-receipt"):
+            payment = session.get(Payment, uuid.UUID(success["payment_id"]))
+            if payment:
+                try:
+                    receipt = issue_receipt(session, payment, user)
+                    session.commit()
+                    st.session_state.manual_payment_success = {
+                        "message": "Payment verified successfully. Receipt generated.",
+                        "payment_id": str(payment.id),
+                        "receipt_id": str(receipt.id),
+                    }
+                    st.rerun()
+                except Exception as exc:
+                    session.rollback()
+                    notice_error(exc)
+
+    top_left, top_right = st.columns([1, 4])
+    if top_left.button("Record Payment", type="primary", use_container_width=True, key="open-manual-payment"):
+        st.session_state.manual_payment_open = True
+        st.session_state.pop("manual_payment_confirmation", None)
+        st.rerun()
+    top_right.caption("Record and verify payments received directly by the editorial team. Author-submitted confirmations remain available below.")
+
+    all_payments = list(
+        session.scalars(
+            select(Payment)
+            .join(Invoice)
+            .where(Invoice.journal_id == journal.id)
+            .order_by(Payment.submitted_at.desc())
+        )
+    )
+    blocked_invoice_ids = {
+        payment.invoice_id
+        for payment in all_payments
+        if payment.status in {PaymentStatus.SUBMITTED, PaymentStatus.VERIFIED}
+    }
+    eligible_invoices = [
+        invoice
+        for invoice in session.scalars(
+            select(Invoice)
+            .where(
+                Invoice.journal_id == journal.id,
+                Invoice.status.in_([InvoiceStatus.ISSUED, InvoiceStatus.WAITING_PAYMENT]),
+            )
+            .order_by(Invoice.created_at.desc())
+        )
+        if invoice.id not in blocked_invoice_ids
+    ]
+
+    confirmation = st.session_state.get("manual_payment_confirmation")
+    if confirmation:
+        invoice = session.get(Invoice, uuid.UUID(confirmation["invoice_id"]))
+        if invoice is None or invoice.journal_id != journal.id:
+            st.session_state.pop("manual_payment_confirmation", None)
+            st.error("The selected invoice is no longer available.")
+        else:
+            with st.container(border=True):
+                st.subheader("Confirm Manual Payment")
+                st.write(f"**Invoice:** {invoice.invoice_number}")
+                st.write(f"**Amount:** {money(Decimal(confirmation['amount_paid']), invoice.currency)}")
+                st.write(f"**Payment Date:** {confirmation['payment_date']}")
+                st.write(f"**Method:** {confirmation['payment_method']}")
+                amount_received = Decimal(confirmation["amount_paid"])
+                invoice_amount = Decimal(invoice.total_amount)
+                underpayment = amount_received < invoice_amount
+                if underpayment:
+                    st.warning("Amount received is lower than invoice amount.")
+                    underpayment_confirmed = st.checkbox(
+                        "I explicitly confirm this underpayment may mark the invoice as paid.",
+                        key="manual-underpayment-confirmed",
+                    )
+                else:
+                    underpayment_confirmed = True
+                if amount_received > invoice_amount:
+                    st.warning("Amount received is higher than invoice amount. The invoice amount will not be changed.")
+                confirm_col, cancel_col = st.columns(2)
+                confirm_label = (
+                    "Confirm Payment & Generate Receipt"
+                    if confirmation.get("generate_receipt")
+                    else "Confirm Payment"
+                )
+                if confirm_col.button(
+                    confirm_label,
+                    type="primary",
+                    disabled=not underpayment_confirmed,
+                    use_container_width=True,
+                    key="confirm-manual-payment",
+                ):
+                    try:
+                        payment = record_manual_payment(
+                            session,
+                            invoice,
+                            user,
+                            payment_date=date.fromisoformat(confirmation["payment_date"]),
+                            payment_method=confirmation["payment_method"],
+                            amount_paid=amount_received,
+                            payment_reference=confirmation.get("payment_reference"),
+                            notes=confirmation.get("notes"),
+                            upload_name=confirmation.get("upload_name"),
+                            upload_content=confirmation.get("upload_content"),
+                            confirm_underpayment=underpayment_confirmed,
+                        )
+                        session.commit()
+                        receipt = None
+                        receipt_error = None
+                        if confirmation.get("generate_receipt"):
+                            try:
+                                receipt = issue_receipt(session, payment, user)
+                                session.commit()
+                            except Exception:
+                                session.rollback()
+                                receipt_error = "Receipt generation failed; use Create Receipt to retry."
+                        message = "Payment verified successfully."
+                        if receipt:
+                            message += " Receipt generated."
+                        elif receipt_error:
+                            message += f" {receipt_error}"
+                        st.session_state.manual_payment_success = {
+                            "message": message,
+                            "payment_id": str(payment.id),
+                            "receipt_id": str(receipt.id) if receipt else None,
+                        }
+                        st.session_state.pop("manual_payment_confirmation", None)
+                        st.session_state.manual_payment_open = False
+                        st.rerun()
+                    except Exception as exc:
+                        session.rollback()
+                        notice_error(exc)
+                if cancel_col.button("Back to Form", use_container_width=True, key="cancel-manual-confirmation"):
+                    st.session_state.pop("manual_payment_confirmation", None)
+                    st.rerun()
+
+    elif st.session_state.get("manual_payment_open"):
+        with st.container(border=True):
+            st.subheader("Record Payment")
+            if not eligible_invoices:
+                st.info("No issued or unpaid invoices are available for manual payment recording.")
+            else:
+                selected_invoice_id = st.selectbox(
+                    "Invoice",
+                    [str(invoice.id) for invoice in eligible_invoices],
+                    format_func=lambda value: next(
+                        (
+                            f"{invoice.invoice_number} · {invoice.submission.ojs_submission_id or 'Manual'} · "
+                            f"{invoice.submission.manuscript_title[:70]} · {invoice.submission.corresponding_author} · "
+                            f"{money(invoice.total_amount, invoice.currency)}"
+                        )
+                        for invoice in eligible_invoices
+                        if str(invoice.id) == value
+                    ),
+                    key="manual-payment-invoice",
+                )
+                selected_invoice = next(
+                    invoice for invoice in eligible_invoices if str(invoice.id) == selected_invoice_id
+                )
+                details = pd.DataFrame(
+                    [
+                        ("Invoice Number", selected_invoice.invoice_number),
+                        ("Submission ID", selected_invoice.submission.ojs_submission_id or "Manual"),
+                        ("Article Title", selected_invoice.submission.manuscript_title),
+                        ("Corresponding Author", selected_invoice.submission.corresponding_author),
+                        ("Invoice Amount", money(selected_invoice.total_amount, selected_invoice.currency)),
+                    ],
+                    columns=["Field", "Value"],
+                ).set_index("Field")
+                st.table(details)
+                with st.form("manual-payment-form"):
+                    paid_date = st.date_input("Payment Date", value=date.today(), max_value=date.today())
+                    method_choice = st.selectbox("Payment Method", ["Bank Transfer", "QRIS", "Cash", "Other"])
+                    other_method = st.text_input("Other payment method (complete only when Other is selected)")
+                    payment_reference = st.text_input("Payment Reference / Transfer Reference")
+                    amount_received = st.number_input(
+                        "Amount Received",
+                        min_value=0.0,
+                        value=float(selected_invoice.total_amount),
+                        step=1000.0,
+                    )
+                    payment_notes = st.text_area("Payment Notes")
+                    payment_proof = st.file_uploader(
+                        "Payment Proof (optional)",
+                        type=["pdf", "jpg", "jpeg", "png"],
+                    )
+                    action_col, fast_col = st.columns(2)
+                    record_only = action_col.form_submit_button(
+                        "Verify & Record Payment",
+                        use_container_width=True,
+                    )
+                    record_and_receipt = fast_col.form_submit_button(
+                        "Verify Payment & Generate Receipt",
+                        type="primary",
+                        use_container_width=True,
+                    )
+                if record_only or record_and_receipt:
+                    payment_method = other_method.strip() if method_choice == "Other" else method_choice
+                    if not payment_method:
+                        st.error("Payment Method is required.")
+                    elif Decimal(str(amount_received)) > Decimal(selected_invoice.total_amount) and not payment_notes.strip():
+                        st.error("Amount received is higher than invoice amount. Add a payment note before continuing.")
+                    else:
+                        st.session_state.manual_payment_confirmation = {
+                            "invoice_id": str(selected_invoice.id),
+                            "payment_date": paid_date.isoformat(),
+                            "payment_method": payment_method,
+                            "payment_reference": payment_reference.strip() or None,
+                            "amount_paid": str(Decimal(str(amount_received))),
+                            "notes": payment_notes.strip() or None,
+                            "upload_name": payment_proof.name if payment_proof else None,
+                            "upload_content": payment_proof.getvalue() if payment_proof else None,
+                            "generate_receipt": bool(record_and_receipt),
+                        }
+                        st.rerun()
+            if st.button("Close", key="close-manual-payment"):
+                st.session_state.manual_payment_open = False
+                st.session_state.pop("manual_payment_confirmation", None)
+                st.rerun()
+
+    pending = [payment for payment in all_payments if payment.status == PaymentStatus.SUBMITTED]
+    st.subheader("Pending Verification")
+    if not pending:
+        st.info("No pending payment confirmations.")
+        st.caption("If payment was received manually, use Record Payment to verify an issued invoice.")
+        if st.button("Record Payment", key="empty-record-payment"):
+            st.session_state.manual_payment_open = True
+            st.rerun()
+    for payment in pending:
         with st.container(border=True):
             st.write(f"**{payment.invoice.invoice_number} · {payment.payer_name}**")
             st.caption(f"{payment.payment_date} · {money(payment.amount_paid, payment.invoice.currency)} · {payment.status.value}")
-            if Path(payment.proof_path).is_file():
+            if payment.proof_path and Path(payment.proof_path).is_file():
                 mime = mimetype_for(payment.proof_original_name)
                 st.download_button("View/download payment proof", Path(payment.proof_path).read_bytes(), file_name=payment.proof_original_name, mime=mime, key=f"proof-{payment.id}")
             if payment.author_notes:
                 st.write(f"Author note: {payment.author_notes}")
-            if payment.status == PaymentStatus.SUBMITTED:
-                note = st.text_area("Internal note", key=f"pay-note-{payment.id}")
-                col1, col2 = st.columns(2)
-                if col1.button("Verify", type="primary", key=f"verify-{payment.id}"):
-                    try:
-                        verify_payment(session, payment, user, note or None)
-                        session.commit()
-                        st.rerun()
-                    except Exception as exc:
-                        session.rollback()
-                        notice_error(exc)
-                if col2.button("Reject / request correction", key=f"reject-{payment.id}"):
-                    try:
-                        reject_payment(session, payment, user, note)
-                        session.commit()
-                        st.rerun()
-                    except Exception as exc:
-                        session.rollback()
-                        notice_error(exc)
+            note = st.text_area("Internal note", key=f"pay-note-{payment.id}")
+            col1, col2, col3 = st.columns(3)
+            if col1.button("Verify", type="primary", key=f"verify-{payment.id}"):
+                try:
+                    verify_payment(session, payment, user, note or None)
+                    session.commit()
+                    st.session_state.manual_payment_success = {
+                        "message": "Payment verified successfully.",
+                        "payment_id": str(payment.id),
+                        "receipt_id": None,
+                    }
+                    st.rerun()
+                except Exception as exc:
+                    session.rollback()
+                    notice_error(exc)
+            if col2.button("Verify & Generate Receipt", key=f"verify-receipt-{payment.id}"):
+                try:
+                    verify_payment(session, payment, user, note or None)
+                    session.commit()
+                    receipt = issue_receipt(session, payment, user)
+                    session.commit()
+                    st.session_state.manual_payment_success = {
+                        "message": "Payment verified successfully. Receipt generated.",
+                        "payment_id": str(payment.id),
+                        "receipt_id": str(receipt.id),
+                    }
+                    st.rerun()
+                except Exception as exc:
+                    session.rollback()
+                    notice_error(exc)
+            if col3.button("Reject / request correction", key=f"reject-{payment.id}"):
+                try:
+                    reject_payment(session, payment, user, note)
+                    session.commit()
+                    st.rerun()
+                except Exception as exc:
+                    session.rollback()
+                    notice_error(exc)
+
+    verified = [payment for payment in all_payments if payment.status == PaymentStatus.VERIFIED]
+    receipt_by_payment = {
+        receipt.payment_id: receipt
+        for receipt in session.scalars(
+            select(Receipt).where(Receipt.journal_id == journal.id).order_by(Receipt.created_at.desc())
+        )
+    }
+    st.subheader("Verified Payments")
+    if not verified:
+        st.caption("No verified payments yet.")
+    else:
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "Payment Date": payment.payment_date,
+                        "Invoice Number": payment.invoice.invoice_number,
+                        "Submission ID": payment.invoice.submission.ojs_submission_id or "Manual",
+                        "Author": payment.payer_name,
+                        "Amount": money(payment.amount_paid, payment.invoice.currency),
+                        "Method": payment.payment_method,
+                        "Status": payment.status.value,
+                        "Receipt Status": "GENERATED" if payment.id in receipt_by_payment else "NOT GENERATED",
+                    }
+                    for payment in verified
+                ]
+            ),
+            hide_index=True,
+            use_container_width=True,
+        )
+        action_payment_id = st.selectbox(
+            "Payment actions",
+            [str(payment.id) for payment in verified],
+            format_func=lambda value: next(
+                f"{payment.invoice.invoice_number} · {payment.payer_name} · {money(payment.amount_paid, payment.invoice.currency)}"
+                for payment in verified
+                if str(payment.id) == value
+            ),
+            key="verified-payment-actions",
+        )
+        action_payment = next(payment for payment in verified if str(payment.id) == action_payment_id)
+        action_receipt = receipt_by_payment.get(action_payment.id)
+        view_col, invoice_col, receipt_col = st.columns(3)
+        if view_col.button("View", use_container_width=True, key="view-verified-payment"):
+            st.session_state.payment_view_id = str(action_payment.id)
+        if invoice_col.button(
+            "Open Invoice",
+            use_container_width=True,
+            disabled=not (action_payment.invoice.pdf_path and Path(action_payment.invoice.pdf_path).is_file()),
+            key="open-verified-invoice",
+        ):
+            st.session_state.payment_invoice_preview = str(action_payment.invoice.id)
+        if action_receipt:
+            if receipt_col.button(
+                "Open Receipt",
+                use_container_width=True,
+                disabled=not (action_receipt.pdf_path and Path(action_receipt.pdf_path).is_file()),
+                key="open-verified-receipt",
+            ):
+                st.session_state.payment_receipt_preview = str(action_receipt.id)
+        elif receipt_col.button("Generate Receipt", type="primary", use_container_width=True, key="generate-verified-receipt"):
+            try:
+                receipt = issue_receipt(session, action_payment, user)
+                session.commit()
+                st.session_state.manual_payment_success = {
+                    "message": "Receipt generated.",
+                    "payment_id": str(action_payment.id),
+                    "receipt_id": str(receipt.id),
+                }
+                st.rerun()
+            except Exception as exc:
+                session.rollback()
+                notice_error(exc)
+
+        if st.session_state.get("payment_view_id") == str(action_payment.id):
+            with st.container(border=True):
+                st.write(f"**{action_payment.invoice.invoice_number} · {action_payment.payer_name}**")
+                st.write(f"Payment date: {action_payment.payment_date}")
+                st.write(f"Method: {action_payment.payment_method}")
+                st.write(f"Amount received: {money(action_payment.amount_paid, action_payment.invoice.currency)}")
+                if action_payment.internal_notes:
+                    st.write(f"Notes: {action_payment.internal_notes}")
+                if action_payment.proof_path and Path(action_payment.proof_path).is_file():
+                    st.download_button(
+                        "View/download payment proof",
+                        Path(action_payment.proof_path).read_bytes(),
+                        file_name=action_payment.proof_original_name,
+                        mime=mimetype_for(action_payment.proof_original_name),
+                        key=f"verified-proof-{action_payment.id}",
+                    )
+        if (
+            st.session_state.get("payment_invoice_preview") == str(action_payment.invoice.id)
+            and action_payment.invoice.pdf_path
+            and Path(action_payment.invoice.pdf_path).is_file()
+        ):
+            show_pdf(action_payment.invoice.pdf_path, height=700)
+        if (
+            action_receipt
+            and st.session_state.get("payment_receipt_preview") == str(action_receipt.id)
+            and action_receipt.pdf_path
+            and Path(action_receipt.pdf_path).is_file()
+        ):
+            show_pdf(action_receipt.pdf_path, height=700)
+
+    rejected = [payment for payment in all_payments if payment.status == PaymentStatus.REJECTED]
+    if rejected:
+        with st.expander(f"Rejected confirmations ({len(rejected)})"):
+            for payment in rejected:
+                st.write(
+                    f"{payment.invoice.invoice_number} · {payment.payer_name} · "
+                    f"{money(payment.amount_paid, payment.invoice.currency)}"
+                )
+                if payment.internal_notes:
+                    st.caption(payment.internal_notes)
 
 
 def mimetype_for(filename: str) -> str:
