@@ -10,6 +10,7 @@ import copy
 import io
 import posixpath
 import re
+from datetime import datetime
 from pathlib import PurePosixPath
 from urllib.parse import unquote
 from urllib.parse import urlsplit
@@ -50,6 +51,9 @@ def short_title_4w(title: str) -> str:
 def resolve_elkolind_metadata(raw: dict[str, object], article_title: str) -> dict[str, str]:
     values = {key: str(raw.get(key) or "").strip() for key in ELKOLIND_FIELDS}
     values["short_title_4w"] = short_title_4w(article_title)
+    for _label, date_key in DATE_LABELS:
+        if values[date_key]:
+            values[date_key] = format_metadata_date(values[date_key])
     for key in ("volume", "issue"):
         if values[key] and not re.fullmatch(r"[A-Za-z0-9-]{1,16}", values[key]):
             raise ArticleMetadataError(f"Invalid ELKOLIND {key}.")
@@ -132,6 +136,48 @@ def _word_on_off_enabled(node: etree._Element | None) -> bool:
     return value not in {"0", "false", "off", "no"}
 
 
+DATE_LABELS = (("Received", "received_date"), ("Revised", "revised_date"), ("Accepted", "accepted_date"))
+_DATE_FORMATS = ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y", "%Y/%m/%d")
+
+
+def format_metadata_date(value: str) -> str:
+    """Render a date as dd/mm/yyyy (the ELKOLIND xx/xx/xxxx style); free text such as '1 July 2026' is kept."""
+    text = value.strip()
+    for pattern in _DATE_FORMATS:
+        try:
+            return datetime.strptime(text[:10], pattern).strftime("%d/%m/%Y")
+        except ValueError:
+            continue
+    return text
+
+
+def _splice_text_nodes(nodes: list, start: int, end: int, replacement: str) -> None:
+    """Replace combined-text span [start, end) across Word text nodes, keeping the first/last run formatting."""
+    offsets = []
+    cursor = 0
+    for index, node in enumerate(nodes):
+        length = len(node.text or "")
+        offsets.append((cursor, cursor + length, index))
+        cursor += length
+    first = next((item for item in offsets if item[0] <= start < item[1]), None)
+    last = next((item for item in offsets if item[0] < end <= item[1]), None)
+    if first is None or last is None:
+        raise ArticleMetadataError("A DOCX placeholder spans unsupported Word objects.")
+    first_node, last_node = nodes[first[2]], nodes[last[2]]
+    prefix = (first_node.text or "")[:start - first[0]]
+    suffix = (last_node.text or "")[end - last[0]:]
+    if first[2] == last[2]:
+        first_node.text = prefix + replacement + suffix
+    else:
+        first_node.text = prefix + replacement
+        for index in range(first[2] + 1, last[2]):
+            nodes[index].text = ""
+        last_node.text = suffix
+    for node in (first_node, last_node):
+        if (node.text or "").startswith(" ") or (node.text or "").endswith(" "):
+            node.set(XML_SPACE, "preserve")
+
+
 def _replace_tokens(root: etree._Element, values: dict[str, str]) -> int:
     count = 0
     replacements = {"{{short_title_4w}}…": values.get("short_title_4w", "")}
@@ -146,30 +192,15 @@ def _replace_tokens(root: etree._Element, values: dict[str, str]) -> int:
                     break
                 if not replacement:
                     raise ArticleMetadataError(f"Provide article metadata before replacing {token}.")
-                end = start + len(token)
-                offsets = []
-                cursor = 0
-                for index, node in enumerate(nodes):
-                    length = len(node.text or "")
-                    offsets.append((cursor, cursor + length, index))
-                    cursor += length
-                first = next((item for item in offsets if item[0] <= start < item[1]), None)
-                last = next((item for item in offsets if item[0] < end <= item[1]), None)
-                if first is None or last is None:
-                    raise ArticleMetadataError("A DOCX placeholder spans unsupported Word objects.")
-                first_node, last_node = nodes[first[2]], nodes[last[2]]
-                prefix = (first_node.text or "")[:start - first[0]]
-                suffix = (last_node.text or "")[end - last[0]:]
-                if first[2] == last[2]:
-                    first_node.text = prefix + replacement + suffix
-                else:
-                    first_node.text = prefix + replacement
-                    for index in range(first[2] + 1, last[2]):
-                        nodes[index].text = ""
-                    last_node.text = suffix
-                for node in (first_node, last_node):
-                    if (node.text or "").startswith(" ") or (node.text or "").endswith(" "):
-                        node.set(XML_SPACE, "preserve")
+                _splice_text_nodes(nodes, start, start + len(token), replacement)
+                count += 1
+        for label, key in DATE_LABELS:
+            if not values.get(key):
+                continue
+            combined = "".join(node.text or "" for node in nodes)
+            match = re.search(r"\b" + label + r"\s*:\s*(x{1,2}\s*/\s*x{1,2}\s*/\s*x{2,4})", combined, re.I)
+            if match:
+                _splice_text_nodes(nodes, match.start(1), match.end(1), format_metadata_date(values[key]))
                 count += 1
         unresolved = TOKEN_RE.findall("".join(node.text or "" for node in nodes))
         if unresolved:

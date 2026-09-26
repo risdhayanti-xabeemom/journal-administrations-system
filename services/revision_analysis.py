@@ -92,6 +92,12 @@ def _paragraph_text(element: etree._Element) -> str:
     return "".join(parts)
 
 
+AFFILIATION_RE = re.compile(
+    r"universit|institut|department|departemen|faculty|fakultas|laborator|politeknik|polytechnic|"
+    r"jurusan|program studi|\bprodi\b|\bjalan\b|\bjl\.|kampus|campus|\bkota\b|\bkabupaten\b|\bindonesia\b|"
+    r"\bpo\.? ?box\b|\b\d{5}\b", re.I)
+
+
 def _kind(text: str, style: str, in_table: bool) -> str:
     lower = text.lower().strip()
     if in_table:
@@ -163,8 +169,10 @@ def analyze_manuscript(content: bytes) -> ManuscriptStructure:
             abstract_lines.append(text)
         elif text and in_references:
             references.append(text)
-        elif text and current_section_id == "FRONT_MATTER" and text != title:
-            (affiliations if re.search(r"university|institute|department|faculty|laboratory|universitas", text, re.I) else authors).append(text)
+        elif text and current_section_id == "FRONT_MATTER" and text != title and not in_table:
+            # Table cells in the front matter hold dates and the abstract block, never author lines.
+            is_correspondence = re.search(r"correspond|korespondensi|e-?mail|@", text, re.I)
+            (affiliations if AFFILIATION_RE.search(text) and not is_correspondence else authors).append(text)
         if kind == "TABLE_CAPTION":
             table_captions.append(text)
         elif kind == "FIGURE_CAPTION":

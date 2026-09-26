@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import io
 import json
 import re
@@ -59,10 +60,13 @@ ELKOLIND_ROLE_SPECS: dict[str, dict[str, object]] = {
     "title": {"font": "Gadugi", "size": 48, "alignment": 1},
     "author": {"font": "Gadugi", "size": 20, "alignment": 1, "bold": True},
     "corresponding_author": {"font": "Gadugi", "size": 20, "alignment": 1},
-    "affiliation": {"font": "Gadugi", "size": 18, "alignment": 1},
-    "abstract_heading": {"font": "Gadugi", "size": 18, "alignment": 0, "bold": True},
+    "affiliation": {"font": "Gadugi", "size": 18, "alignment": 1, "bold": False},
+    "date": {"font": "Gadugi", "size": 20, "alignment": 1, "bold": False},
+    "abstract_heading": {"font": "Gadugi", "size": 18, "alignment": 3, "bold": True},
     "abstract": {"font": "Gadugi", "size": 18, "alignment": 3, "bold": False},
     "keywords": {"font": "Gadugi", "size": 18},
+    # Keywords inside the abstract table: only the "Kata Kunci:" / "Keywords:" label is bold (see _keyword_label_ok).
+    "keywords_table": {"font": "Gadugi", "size": 18, "alignment": 3},
     "body": {"font": "Gadugi", "size": 20, "alignment": 3},
     "heading1": {"font": "Gadugi", "size": 20, "alignment": 0, "bold": True},
     "heading2": {"font": "Gadugi", "size": 20, "alignment": 0, "bold": True},
@@ -395,11 +399,117 @@ def _replace_paragraph_text(paragraph: etree._Element, replacement: str) -> None
             node.attrib.pop("{http://www.w3.org/XML/1998/namespace}space", None)
 
 
+DATE_LABEL_RE = re.compile(r"^\s*(?:received|revised|accepted)\s*:", re.I)
+ABSTRACT_LABEL_RE = re.compile(r"^\s*(?:abstrak|abstract)\b", re.I)
+KEYWORDS_LABEL_RE = re.compile(r"^\s*(?:keywords|kata kunci)\s*:", re.I)
+TITLE_ACRONYMS = {
+    "IOT": "IoT", "WIFI": "WiFi", "LED": "LED", "LDR": "LDR", "PLC": "PLC", "PWM": "PWM", "ADC": "ADC",
+    "GPS": "GPS", "GSM": "GSM", "LCD": "LCD", "USB": "USB", "RFID": "RFID", "MQTT": "MQTT", "API": "API",
+    "AI": "AI", "ML": "ML", "CNN": "CNN", "LSTM": "LSTM", "IEEE": "IEEE", "UV": "UV", "PID": "PID",
+    "MPPT": "MPPT", "PV": "PV", "IP": "IP", "AC": "AC", "DC": "DC", "SMS": "SMS", "CCTV": "CCTV",
+    "DHT": "DHT", "ESP": "ESP", "PCB": "PCB", "MPU": "MPU", "IMU": "IMU", "RTC": "RTC", "HMI": "HMI",
+}
+
+
+def title_case_each_word(text: str) -> str:
+    """Capitalize the first letter of every word; keep acronyms and mixed-case tokens (IoT, ESP32, pH)."""
+    def fix(word: str) -> str:
+        match = re.fullmatch(r"([^A-Za-z0-9]*)(.*?)([^A-Za-z0-9]*)", word, re.S)
+        lead, core, trail = match.groups() if match else ("", word, "")
+        if not core:
+            return word
+        if "-" in core:
+            return lead + "-".join(fix(part) for part in core.split("-")) + trail
+        letters = re.sub(r"[^A-Za-z]", "", core)
+        if not letters or any(ch.isdigit() for ch in core):
+            return word
+        if core.upper() in TITLE_ACRONYMS:
+            return lead + TITLE_ACRONYMS[core.upper()] + trail
+        if core.islower() or core.isupper() or core == core.capitalize():
+            return lead + core[:1].upper() + core[1:].lower() + trail
+        return word
+    return re.sub(r"\S+", lambda m: fix(m.group(0)), text)
+
+
+def _front_table_role(info, structure) -> str | None:
+    """Classify front-matter table cells: submission dates and the ABSTRAK / ABSTRACT block."""
+    if info.kind != "TABLE_CELL" or info.section_id != "FRONT_MATTER":
+        return None
+    in_abstract = False
+    for item in structure.paragraphs:
+        if item.section_id != "FRONT_MATTER":
+            break
+        text = item.text.strip()
+        if item.kind != "TABLE_CELL":
+            if text:
+                in_abstract = False
+            continue
+        role = None
+        if DATE_LABEL_RE.match(text):
+            role, in_abstract = "date", False
+        elif ABSTRACT_LABEL_RE.match(text) and len(text) < 40:
+            role, in_abstract = "abstract_heading", True
+        elif KEYWORDS_LABEL_RE.match(text):
+            role, in_abstract = "keywords_table", False
+        elif in_abstract and text:
+            role = "abstract"
+        if item.index == info.index:
+            return role
+    return None
+
+
+def _keyword_label_length(paragraph: etree._Element) -> int:
+    text = "".join(paragraph.xpath(".//w:r[w:t]/w:t/text()", namespaces=NS))
+    match = KEYWORDS_LABEL_RE.match(text)
+    return match.end() if match else 0
+
+
+def _keyword_label_ok(paragraph: etree._Element) -> bool:
+    """True when only the leading 'Keywords:' label is bold."""
+    label_end = _keyword_label_length(paragraph)
+    position = 0
+    for run in _ordinary_text_runs(paragraph):
+        length = len("".join(run.xpath("./w:t/text()", namespaces=NS)))
+        properties = run.find(W_TAG + "rPr")
+        bold = _on_off_value(properties.find(W_TAG + "b")) if properties is not None else False
+        if length and bold != (position < label_end):
+            return False
+        position += length
+    return True
+
+
+def _format_keywords_table(paragraph: etree._Element, spec: dict[str, object]) -> None:
+    """Apply the keyword spec, then bold only the label (splitting a run at the colon if needed)."""
+    label_end = _keyword_label_length(paragraph)
+    position = 0
+    for run in list(_ordinary_text_runs(paragraph)):
+        texts = run.xpath("./w:t", namespaces=NS)
+        run_text = "".join(node.text or "" for node in texts)
+        length = len(run_text)
+        if length and position < label_end < position + length and len(texts) == 1:
+            split_at = label_end - position
+            tail = copy.deepcopy(run)
+            tail_node = tail.xpath("./w:t", namespaces=NS)[0]
+            texts[0].text, tail_node.text = run_text[:split_at], run_text[split_at:]
+            for node in (texts[0], tail_node):
+                if (node.text or "").startswith(" ") or (node.text or "").endswith(" "):
+                    node.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+            run.addnext(tail)
+            _set_run_format(run, {**spec, "bold": True})
+            _set_run_format(tail, {**spec, "bold": False})
+        else:
+            _set_run_format(run, {**spec, "bold": position < label_end})
+        position += length
+
+
 def _role(info, first_text_index: int, structure) -> str | None:
     if not info.text.strip():
         return None
     if info.index == first_text_index:
         return "title"
+    front_table = _front_table_role(info, structure)
+    if front_table:
+        return front_table
     if info.kind == "ABSTRACT_HEADING":
         return "abstract_heading"
     if info.kind == "KEYWORDS":
@@ -505,6 +615,10 @@ def _elkolind_semantic_compliant(root: etree._Element, styles: etree._Element,
             # excluded from the semantic auto-fix aggregate.
             continue
         if not _paragraph_format_matches(paragraph, document, spec):
+            return False
+        if role == "keywords_table" and not _keyword_label_ok(paragraph):
+            return False
+        if role == "title" and _simple_text_paragraph(paragraph) and title_case_each_word(info.text) != info.text:
             return False
         if role in {"body", "keywords", "figure_caption", "table_caption"} and _paragraph_all_runs_bold(paragraph, styles):
             return False
@@ -989,8 +1103,15 @@ def _apply_elkolind_semantic_formatting(root: etree._Element, styles: etree._Ele
         normalized = _normalized_caption(info.kind, info.text)
         if normalized is not None and normalized != info.text:
             _replace_paragraph_text(paragraph, normalized)
-        for run in _ordinary_text_runs(paragraph):
-            _set_run_format(run, run_spec)
+        if role == "title" and _simple_text_paragraph(paragraph):
+            titled = title_case_each_word(info.text)
+            if titled != info.text:
+                _replace_paragraph_text(paragraph, titled)
+        if role == "keywords_table":
+            _format_keywords_table(paragraph, run_spec)
+        else:
+            for run in _ordinary_text_runs(paragraph):
+                _set_run_format(run, run_spec)
         if "alignment" in spec:
             _set_paragraph_alignment(paragraph, spec["alignment"])
     for style in styles.xpath("./w:style", namespaces=NS):
@@ -1090,6 +1211,12 @@ def _caption_integrity_patches(original: bytes, formatted: bytes) -> list[Approv
     after = analyze_manuscript(formatted)
     revised = {item.identifier: item for item in after.paragraphs}
     patches = []
+    first_text = next((item for item in before.paragraphs if item.text.strip()), None)
+    if first_text is not None:
+        titled = title_case_each_word(first_text.text)
+        current_title = revised.get(first_text.identifier)
+        if titled != first_text.text and current_title is not None and current_title.text == titled:
+            patches.append(ApprovedPatch(first_text.identifier, first_text.text, titled, None))
     for item in before.paragraphs:
         if item.kind not in {"FIGURE_CAPTION", "TABLE_CAPTION"}:
             continue

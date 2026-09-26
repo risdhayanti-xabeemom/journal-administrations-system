@@ -56,7 +56,7 @@ ELKOLIND_INITIAL_RULES: dict[str, object] = {
     "paper": "A4", "top_margin_mm": 19, "bottom_margin_mm": 43,
     "left_margin_mm": 20, "right_margin_mm": 20,
     "layout": "single_column", "default_font": "Gadugi", "title_font": "Gadugi",
-    "title_size_pt": 24, "title_alignment": "center", "title_case": "sentence_case",
+    "title_size_pt": 24, "title_alignment": "center", "title_case": "title_case",
     "title_max_words": 15, "abstract_size_pt": 9, "abstract_min_words": 100,
     "abstract_max_words": 200, "keywords_min": 3, "keywords_max": 5,
     "body_size_pt": 10, "header_footer_mode": "MASTER", "formatting_profile": "ELKOLIND",
