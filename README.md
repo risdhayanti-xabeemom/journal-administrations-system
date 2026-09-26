@@ -147,13 +147,19 @@ Halaman publik hanya menampilkan jenis/nomor/status dokumen, jurnal, Submission 
 
 Raw token pembayaran hanya ditampilkan satu kali ketika invoice diterbitkan; database hanya menyimpan SHA-256 hash dan waktu kedaluwarsa. Jika tautan hilang, invoice perlu dibatalkan dan diterbitkan ulang pada versi berikutnya (fitur rotasi token terpisah dapat ditambahkan dengan audit trail).
 
+## Verifikasi pembayaran manual
+
+`FINANCE · Payment Verification` mendukung konfirmasi author dan pencatatan langsung oleh admin. Untuk pembayaran manual, admin memilih invoice `ISSUED`/`WAITING_PAYMENT`, mencatat tanggal, metode, referensi, nominal, catatan, dan bukti opsional, lalu dapat langsung membuat receipt.
+
+Bukti pembayaran tetap privat. Pembayaran terverifikasi tidak dapat diduplikasi. Nominal kurang membutuhkan konfirmasi eksplisit, sedangkan nominal lebih membutuhkan catatan dan tidak mengubah nilai invoice. Audit mencatat `PAYMENT_RECORDED`, `PAYMENT_VERIFIED`, `INVOICE_MARKED_PAID`, dan `RECEIPT_GENERATED` tanpa menyimpan isi bukti pembayaran.
+
 ## Testing
 
 ```powershell
 pytest -q
 ```
 
-Tes mencakup hashing password, format Rupiah, upload/versioning/activation Master DOCX, replacement ELKOLIND dan JASENS beserta identitas Editor-in-Chief statis, bulan Romawi IX–XII dan rollover tahun, preview tanpa konsumsi nomor, state transition, lifecycle LoA–invoice–payment–receipt, URL/token/status/privacy verifikasi, pemisahan QRIS dan QR verifikasi, serta alias/pemetaan/impor parsial CSV-XLSX OJS pada SQLite terisolasi.
+Tes mencakup hashing password, format Rupiah, upload/versioning/activation Master DOCX, replacement ELKOLIND dan JASENS beserta identitas Editor-in-Chief statis, bulan Romawi IX–XII dan rollover tahun, preview tanpa konsumsi nomor, state transition, lifecycle LoA–invoice–payment–receipt, pembayaran manual/duplikat/validasi nominal/bukti opsional/receipt cepat, URL/token/status/privacy verifikasi, pemisahan QRIS dan QR verifikasi, serta alias/pemetaan/impor parsial CSV-XLSX OJS pada SQLite terisolasi.
 
 ## Quick Manuscript Template Revision
 
