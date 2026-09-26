@@ -50,16 +50,17 @@ FORMAT_OBJECT_FIELDS = {
     "reference_format": {"style", "numbering", "size_pt", "preserve_entries", "font"},
 }
 
-# Semantic defaults are not DOCX text placeholders. Left/right margins intentionally
-# remain unresolved until an administrator reconciles the written and physical master.
+# Semantic defaults are not DOCX text placeholders. Left/right margins were decided by the
+# administrator as 20 mm, so no further confirmation step is required.
 ELKOLIND_INITIAL_RULES: dict[str, object] = {
     "paper": "A4", "top_margin_mm": 19, "bottom_margin_mm": 43,
+    "left_margin_mm": 20, "right_margin_mm": 20,
     "layout": "single_column", "default_font": "Gadugi", "title_font": "Gadugi",
     "title_size_pt": 24, "title_alignment": "center", "title_case": "sentence_case",
     "title_max_words": 15, "abstract_size_pt": 9, "abstract_min_words": 100,
     "abstract_max_words": 200, "keywords_min": 3, "keywords_max": 5,
     "body_size_pt": 10, "header_footer_mode": "MASTER", "formatting_profile": "ELKOLIND",
-    "require_lr_margin_confirmation": True,
+    "require_lr_margin_confirmation": False,
     "figure_caption_prefix": "Gambar", "table_caption_prefix": "TABEL",
     "author_format": {"source": "master", "font": "Gadugi", "size_pt": 10,
         "alignment": "center", "preserve_order": True},
@@ -209,7 +210,11 @@ def article_template_config(template: DocumentTemplate) -> dict[str, object]:
     if template.journal.abbreviation.upper() == "ELKOLIND":
         data["rules"] = _merge_elkolind_rules(data.get("rules", {}))
         data["rules"]["header_footer_mode"] = "MASTER"
-        data["rules"]["require_lr_margin_confirmation"] = True
+        # Older template versions saved before the 20 mm decision have no margins; fill them in.
+        for edge in ("left_margin_mm", "right_margin_mm"):
+            if data["rules"].get(edge) is None:
+                data["rules"][edge] = 20
+        data["rules"]["require_lr_margin_confirmation"] = False
     return data
 
 
@@ -220,9 +225,8 @@ def upload_article_template(session: Session, journal: Journal, user: User, *, f
     validate_revision_upload(filename, content, manuscript=True)
     initial = ELKOLIND_INITIAL_RULES if journal.abbreviation.upper() == "ELKOLIND" else {}
     submitted = _merge_elkolind_rules(rules) if initial else (rules or {})
-    if initial and (submitted.get("header_footer_mode") != "MASTER" or
-                    submitted.get("require_lr_margin_confirmation") is not True):
-        raise ArticleTemplateError("ELKOLIND requires the official master header/footer and confirmed left/right margins.")
+    if initial and submitted.get("header_footer_mode") != "MASTER":
+        raise ArticleTemplateError("ELKOLIND requires the official master header/footer.")
     validated_rules = validate_article_rules(submitted)
     profile = extract_style_profile(content)
     with ZipFile(io.BytesIO(content)) as archive:

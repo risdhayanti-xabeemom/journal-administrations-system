@@ -625,7 +625,9 @@ def test_journal_template_versioning_and_authorization(case):
     assert successor.version == 3 and active_article_template(session, ja.id).id == successor.id
     assert article_template_config(first)["rules"]["required_sections"] == ["Introduction", "References"]
     assert article_template_config(first)["rules"]["paper"] == "A4"
-    assert "left_margin_mm" not in article_template_config(first)["rules"]
+    assert article_template_config(first)["rules"]["left_margin_mm"] == 20
+    assert article_template_config(first)["rules"]["right_margin_mm"] == 20
+    assert article_template_config(first)["rules"]["require_lr_margin_confirmation"] is False
     assert article_template_config(successor)["rules"]["style_overrides"]["heading1"]["size_pt"] == 14
     assert first.checksum == __import__("hashlib").sha256(first_content).hexdigest()
 
@@ -940,11 +942,14 @@ def test_elkolind_short_title_and_doi_fallback():
         resolve_elkolind_metadata({"volume": "13", "issue": "3", "doi_full": "file:///secret"}, "Title")
 
 
-def test_elkolind_rule_audit_does_not_guess_left_right_margins():
+def test_elkolind_rule_audit_uses_decided_20mm_left_right_margins():
     findings = audit_article(_manuscript(), extract_style_profile(_elkolind_template()),
         ELKOLIND_INITIAL_RULES)
-    assert sum(item.status == "MANUAL_ACTION_REQUIRED" and item.check in {"Left Margin", "Right Margin"}
-               for item in findings) == 2
+    assert not any(item.status == "MANUAL_ACTION_REQUIRED" and item.check in {"Left Margin", "Right Margin"}
+                   for item in findings)
+    margins = [item for item in findings if item.check in {"Left Margin", "Right Margin"}]
+    assert len(margins) == 2
+    assert all(item.expected == str(__import__("docx").shared.Mm(20).twips) for item in margins)
     assert any(item.check == "Top Margin" and item.expected == str(__import__("docx").shared.Mm(19).twips)
                for item in findings)
     assert any(item.category == "Title" and item.attribute == "size" and item.expected == "48"

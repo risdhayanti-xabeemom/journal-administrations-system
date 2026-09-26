@@ -107,31 +107,6 @@ def article_templates_panel(session: Session, journal: Journal, user: User, show
                     st.error(str(exc))
         with st.expander("Extracted style profile", expanded=False):
             st.json(config["profile"])
-        if journal.abbreviation.upper() == "ELKOLIND":
-            left_physical = round(config["profile"]["page"]["left_margin"] * 25.4 / 1440, 2)
-            right_physical = round(config["profile"]["page"]["right_margin"] * 25.4 / 1440, 2)
-            with st.expander("Confirm ELKOLIND left/right margins", expanded=True):
-                st.warning("The written ELKOLIND instruction says 14.32 mm, but the uploaded DOCX uses different physical margins. Confirm the authoritative values; formatting remains blocked until both are confirmed.")
-                st.caption(f"Uploaded DOCX: left {left_physical:.2f} mm · right {right_physical:.2f} mm. Written instruction: 14.32 mm each.")
-                margin_columns = st.columns(2)
-                left = margin_columns[0].number_input("Confirmed left margin (mm)", min_value=0.0, max_value=100.0,
-                    value=float(config["rules"].get("left_margin_mm", left_physical)), step=0.01, format="%.2f",
-                    key=f"article-left-margin-{current.id}")
-                right = margin_columns[1].number_input("Confirmed right margin (mm)", min_value=0.0, max_value=100.0,
-                    value=float(config["rules"].get("right_margin_mm", right_physical)), step=0.01, format="%.2f",
-                    key=f"article-right-margin-{current.id}")
-                confirmed = st.checkbox("I compared the official DOCX with the written margin instruction and confirm these values.",
-                    key=f"article-margin-confirm-{current.id}")
-                if st.button("Save confirmed margins as new version", disabled=not confirmed,
-                             key=f"article-margin-save-{current.id}"):
-                    try:
-                        update_article_rules(session, journal, user, current.id,
-                            {**config["rules"], "left_margin_mm": left, "right_margin_mm": right})
-                        st.success("Confirmed margin rules were saved in a new retained template version.")
-                        st.rerun()
-                    except Exception as exc:
-                        session.rollback()
-                        st.error(str(exc))
     with st.expander("Upload Article Template" if not current else "Replace Article Template", expanded=not bool(current)):
         file = st.file_uploader("Official Article Template DOCX", type=["docx"], key=f"article-template-upload-{journal.id}")
         default_rules = ELKOLIND_INITIAL_RULES if journal.abbreviation.upper() == "ELKOLIND" else {}

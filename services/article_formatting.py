@@ -541,14 +541,6 @@ def audit_article(manuscript: bytes, profile: dict[str, object], rules: dict[str
             target_page[f"{edge}_margin"] = Mm(float(rules[f"{edge}_margin_mm"])).twips
     single_section = len(document.sections) == 1 and profile.get("sections") == 1
     for key in PAGE_KEYS:
-        if key in {"left_margin", "right_margin"} and rules.get("require_lr_margin_confirmation") and (
-            rules.get("left_margin_mm") is None or rules.get("right_margin_mm") is None
-        ):
-            actual_mm = round(getattr(document.sections[0], key).mm, 2)
-            findings.append(_finding("Document", key.replace("_", " ").title(),
-                "Administrator must confirm: physical master or written 14.32 mm", f"{actual_mm} mm",
-                "MANUAL_ACTION_REQUIRED"))
-            continue
         expected = target_page.get(key)
         if expected is None:
             continue

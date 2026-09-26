@@ -546,12 +546,6 @@ def generate_formatted_manuscript(session: Session, journal: Journal, user: User
     formatted = formatted_body
     if integrity["passed"] and config.get("rules", {}).get("header_footer_mode") == "MASTER":
         rules = config["rules"]
-        if rules.get("require_lr_margin_confirmation") and (
-            rules.get("left_margin_mm") is None or rules.get("right_margin_mm") is None
-        ):
-            raise ArticleRevisionRuleError(
-                "Administrator must confirm both ELKOLIND left/right margins in Article Template Rules before generation."
-            )
         raw_metadata = json.loads(job.metadata_json or "{}")
         values = resolve_elkolind_metadata(raw_metadata, job.article_title) if elkolind else raw_metadata
         formatted, master_details = graft_article_master_header_footer(

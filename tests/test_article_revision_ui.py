@@ -39,7 +39,7 @@ def _article_app(folder: str, abbreviation: str = "UIARTICLE") -> None:
     engine.dispose()
 
 
-def test_elkolind_margin_conflict_requires_explicit_admin_confirmation(tmp_path: Path, monkeypatch):
+def test_elkolind_margins_default_to_20mm_without_confirmation(tmp_path: Path, monkeypatch):
     import services.article_revision_service as revision_service
     import services.article_template_service as template_service
 
@@ -51,21 +51,16 @@ def test_elkolind_margin_conflict_requires_explicit_admin_confirmation(tmp_path:
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document"))
     next(button for button in app.button if button.label == "Upload and activate Article Template").click().run()
     assert not app.exception
-    assert any("14.32 mm" in message.value for message in app.warning)
-    assert app.number_input[0].value != 14.32 or app.number_input[1].value != 14.32
-    app.number_input[0].set_value(14.32)
-    app.number_input[1].set_value(14.32)
-    next(box for box in app.checkbox if "I compared the official DOCX" in box.label).check().run()
-    next(button for button in app.button if button.label == "Save confirmed margins as new version").click().run()
-    assert not app.exception
+    assert not any("margin" in message.value.casefold() for message in app.warning)
+    assert not any("Save confirmed margins" in button.label for button in app.button)
     engine = create_engine("sqlite:///" + (tmp_path / "article-ui.db").as_posix())
     with Session(engine) as session:
         from models import Journal
         from services.article_template_service import active_article_template, article_template_config
         journal = session.scalar(select(Journal).where(Journal.abbreviation == "ELKOLIND"))
-        current = active_article_template(session, journal.id)
-        assert current.version == 2
-        assert article_template_config(current)["rules"]["left_margin_mm"] == 14.32
+        rules = article_template_config(active_article_template(session, journal.id))["rules"]
+        assert rules["left_margin_mm"] == 20 and rules["right_margin_mm"] == 20
+        assert rules["require_lr_margin_confirmation"] is False
     engine.dispose()
 
 
