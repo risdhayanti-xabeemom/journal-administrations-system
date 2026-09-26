@@ -83,7 +83,9 @@ class SupabaseRevisionStorage:
                 return response.read(settings.revision_max_file_bytes + 1)
         except (urllib.error.URLError, TimeoutError) as exc:
             # Never include upstream URLs or responses: they may contain unpublished content.
-            raise StorageUnavailable("Private revision storage is unavailable; no public download was created.") from exc
+            # The HTTP status code / network reason is safe to show and makes misconfiguration diagnosable.
+            detail = f"HTTP {exc.code}" if isinstance(exc, urllib.error.HTTPError) else type(exc).__name__
+            raise StorageUnavailable(f"Private revision storage is unavailable ({method} {detail}); no public download was created.") from exc
 
     def _object_url(self, key: str, *, authenticated: bool) -> str:
         if not re.fullmatch(r"[0-9a-f-]{36}/[a-z][a-z0-9_]*/[0-9a-f]{32}\.(?:docx|pdf|txt|json|xlsx)", key):
