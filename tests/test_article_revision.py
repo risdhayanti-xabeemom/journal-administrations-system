@@ -583,6 +583,53 @@ def test_safe_web_hyperlinks_allowed_but_external_embeds_rejected():
         validate_revision_upload("article.docx", with_external("image", "https://example.com/figure.png"), manuscript=True)
     with pytest.raises(RevisionFileError):
         validate_revision_upload("article.docx", with_external("hyperlink", "file:///C:/private/data"), manuscript=True)
+    with pytest.raises(RevisionFileError):
+        validate_revision_upload("article.docx", with_external("oleObject", "Book1"), manuscript=True)
+
+
+def test_native_chart_external_data_link_is_allowed_but_only_from_a_chart_part():
+    """A native Word chart's <c:externalData> stub (Target='Book1', never dereferenced by
+    JAS) must not reject the manuscript; the same relationship type from a non-chart part
+    (e.g. spliced into the document's own rels) must still be rejected."""
+    from lxml import etree
+
+    original = _manuscript()
+    relationships = "http://schemas.openxmlformats.org/package/2006/relationships"
+    chart_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/oleObject" '
+        'Target="Book1" TargetMode="External"/></Relationships>'
+    ).encode("utf-8")
+
+    def with_chart_data_link() -> bytes:
+        output = io.BytesIO()
+        with ZipFile(io.BytesIO(original)) as source, ZipFile(output, "w") as destination:
+            for member in source.infolist():
+                destination.writestr(member, source.read(member.filename))
+            destination.writestr("word/charts/_rels/chart1.xml.rels", chart_rels)
+        return output.getvalue()
+
+    def with_oleobject_outside_chart() -> bytes:
+        output = io.BytesIO()
+        with ZipFile(io.BytesIO(original)) as source, ZipFile(output, "w") as destination:
+            for member in source.infolist():
+                data = source.read(member.filename)
+                if member.filename == "word/_rels/document.xml.rels":
+                    root = etree.fromstring(data)
+                    link = etree.SubElement(root, f"{{{relationships}}}Relationship")
+                    link.set("Id", "rId999")
+                    link.set("Type", "http://schemas.openxmlformats.org/officeDocument/2006/relationships/oleObject")
+                    link.set("Target", "Book1")
+                    link.set("TargetMode", "External")
+                    data = etree.tostring(root, encoding="UTF-8", xml_declaration=True)
+                destination.writestr(member, data)
+        return output.getvalue()
+
+    validate_revision_upload("article.docx", with_chart_data_link(), manuscript=True)
+    with pytest.raises(RevisionFileError):
+        validate_revision_upload("article.docx", with_oleobject_outside_chart(), manuscript=True)
 
 
 def test_rules_and_report_validation():

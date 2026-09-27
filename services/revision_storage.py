@@ -159,14 +159,24 @@ def validate_revision_upload(filename: str, content: bytes, *, manuscript: bool 
                 for name in names:
                     if name.endswith(".rels"):
                         root = etree.fromstring(archive.read(name), parser=etree.XMLParser(resolve_entities=False, no_network=True))
+                        # A native Word/Excel chart always carries a chart-data relationship
+                        # (<c:externalData>) recorded with TargetMode="External" (commonly
+                        # Target="Book1", autoUpdate disabled). JAS never dereferences it —
+                        # no live refresh, no rendering fetch — so it is not a real embedded
+                        # external resource; without this narrow exception every manuscript
+                        # or template containing an ordinary chart figure would be rejected.
+                        is_chart_rels = re.fullmatch(r"word/charts/_rels/chart\d+\.xml\.rels", name) is not None
                         for node in root:
                             if node.get("TargetMode") != "External":
                                 continue
                             relationship_type = node.get("Type", "")
                             target = node.get("Target", "")
                             scheme = urlparse(target).scheme.lower()
-                            if not relationship_type.endswith("/hyperlink") or scheme not in {"http", "https", "mailto"}:
-                                raise RevisionFileError("DOCX with external embedded resources is not accepted; ordinary web hyperlinks are allowed.")
+                            if relationship_type.endswith("/hyperlink") and scheme in {"http", "https", "mailto"}:
+                                continue
+                            if is_chart_rels and relationship_type.endswith(("/oleObject", "/package")):
+                                continue
+                            raise RevisionFileError("DOCX with external embedded resources is not accepted; ordinary web hyperlinks are allowed.")
         except BadZipFile as exc:
             raise RevisionFileError("DOCX package is damaged.") from exc
     elif suffix == ".pdf":
