@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
 
@@ -13,11 +12,12 @@ from services.docx_templates import (
     REQUIRED_FIELDS,
     TemplateError,
     convert_docx_to_pdf,
-    escaped_filename,
     extract_placeholders,
+    temp_docx_file,
     validate_docx_bytes,
     validate_required_fields,
 )
+from services.revision_storage import RevisionStorage, get_revision_storage
 
 
 def active_loa_template(session: Session, journal_id) -> DocumentTemplate | None:
@@ -35,6 +35,11 @@ def _default_mapping(path: Path) -> str:
     return json.dumps(mapping, ensure_ascii=False, sort_keys=True)
 
 
+def loa_template_bytes(template: DocumentTemplate, *, storage: RevisionStorage | None = None) -> bytes:
+    """Read a master LoA template's DOCX bytes from private Storage."""
+    return (storage or get_revision_storage()).read(template.storage_path)
+
+
 def upload_loa_template(
     session: Session,
     journal: Journal,
@@ -43,6 +48,7 @@ def upload_loa_template(
     original_filename: str,
     content: bytes,
     activate: bool = True,
+    storage: RevisionStorage | None = None,
 ) -> DocumentTemplate:
     if Path(original_filename).suffix.lower() != ".docx":
         raise TemplateError("Master LoA templates must be uploaded as DOCX files.")
@@ -53,16 +59,12 @@ def upload_loa_template(
             DocumentTemplate.template_type == "LOA",
         )
     ) or 0) + 1
-    folder = settings.template_dir / "loa" / journal.abbreviation.lower() / f"v{version}"
-    folder.mkdir(parents=True, exist_ok=True)
-    target = folder / escaped_filename(Path(original_filename).name)
-    target.write_bytes(content)
-    try:
-        validate_required_fields(target, journal.abbreviation)
-    except Exception:
-        target.unlink(missing_ok=True)
-        raise
-    checksum = hashlib.sha256(content).hexdigest()
+    # Streamlit Cloud's local disk is not durable: validate against a throwaway temp
+    # file, then persist the bytes in private Storage so the template survives reboots.
+    with temp_docx_file(content) as path:
+        validate_required_fields(path, journal.abbreviation)
+        mapping = _default_mapping(path)
+    key, digest = (storage or get_revision_storage()).put(journal.id, "loa_template", content, ".docx")
     if activate:
         current = active_loa_template(session, journal.id)
         if current:
@@ -72,13 +74,13 @@ def upload_loa_template(
         journal_id=journal.id,
         template_type="LOA",
         original_filename=Path(original_filename).name[:255],
-        storage_path=str(target),
+        storage_path=key,
         version=version,
         status=TemplateStatus.ACTIVE if activate else TemplateStatus.INACTIVE,
         active_key=f"{journal.id}:LOA" if activate else None,
         uploaded_by=user.id,
-        checksum=checksum,
-        field_mapping=_default_mapping(target),
+        checksum=digest,
+        field_mapping=mapping,
     )
     session.add(template)
     session.flush()
@@ -90,7 +92,7 @@ def upload_loa_template(
         object_id=template.id,
         user_id=user.id,
         journal_id=journal.id,
-        new={"filename": template.original_filename, "version": version, "checksum": checksum, "active": activate},
+        new={"filename": template.original_filename, "version": version, "checksum": digest, "active": activate},
     )
     return template
 
@@ -117,14 +119,16 @@ def activate_loa_template(session: Session, template: DocumentTemplate, user: Us
     )
 
 
-def save_field_mapping(session: Session, template: DocumentTemplate, user: User, mapping_text: str) -> None:
+def save_field_mapping(session: Session, template: DocumentTemplate, user: User, mapping_text: str,
+                       *, storage: RevisionStorage | None = None) -> None:
     try:
         mapping = json.loads(mapping_text)
     except json.JSONDecodeError as exc:
         raise TemplateError(f"Field mapping must be valid JSON: {exc}") from exc
     if not isinstance(mapping, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in mapping.items()):
         raise TemplateError("Field mapping must be a JSON object of placeholder-to-source strings.")
-    available = {field[2:-2] for field in extract_placeholders(template.storage_path)}
+    with temp_docx_file(loa_template_bytes(template, storage=storage)) as path:
+        available = {field[2:-2] for field in extract_placeholders(path)}
     missing = sorted(available - set(mapping))
     if missing:
         raise TemplateError(f"Mapping is missing placeholders: {', '.join(missing)}")
@@ -156,10 +160,11 @@ def mapped_template_values(template: DocumentTemplate, context: dict[str, object
     return {placeholder: context.get(source, "") for placeholder, source in mapping.items()}
 
 
-def preview_master_template(session: Session, template: DocumentTemplate, user: User) -> Path:
-    source = Path(template.storage_path)
+def preview_master_template(session: Session, template: DocumentTemplate, user: User,
+                            *, storage: RevisionStorage | None = None) -> Path:
     output = settings.document_dir / "template-previews" / f"loa-template-{template.id}-v{template.version}.pdf"
-    template.page_count = convert_docx_to_pdf(source, output)
+    with temp_docx_file(loa_template_bytes(template, storage=storage)) as source:
+        template.page_count = convert_docx_to_pdf(source, output)
     template.preview_pdf_path = str(output)
     from services.core import log_audit
     log_audit(

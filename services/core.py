@@ -65,8 +65,10 @@ from services.docx_templates import (
     generate_from_template,
     indonesian_date,
     sha256_file,
+    temp_docx_file,
 )
-from services.template_service import active_loa_template, mapped_template_values
+from services.revision_storage import RevisionStorage
+from services.template_service import active_loa_template, loa_template_bytes, mapped_template_values
 
 
 PBKDF2_ITERATIONS = 600_000
@@ -531,6 +533,7 @@ def _generate_template_loa(
     output_stem: str,
     overrides: dict[str, object] | None = None,
     verification_token: str | None = None,
+    storage: RevisionStorage | None = None,
 ) -> GeneratedLoA:
     context = _loa_context(
         submission,
@@ -540,18 +543,21 @@ def _generate_template_loa(
     )
     values = mapped_template_values(template, context)
     output_dir = settings.document_dir / "loa"
-    return generate_from_template(
-        template.storage_path,
-        output_dir / f"{output_stem}.docx",
-        values,
-        output_pdf=output_dir / f"{output_stem}.pdf",
-        # Preview documents have no persisted verification record and therefore
-        # must not contain a fake or refresh-dependent verification QR.
-        qr_url=(verification_url(verification_token) if submission.journal.loa_qr_enabled and verification_token else None),
-        qr_size_mm=submission.journal.loa_qr_size_mm,
-        qr_placement=submission.journal.loa_qr_placement,
-        qr_label="Scan to Verify LoA",
-    )
+    # The master template lives in private Storage, not local disk (which Streamlit Cloud
+    # wipes on every reboot/redeploy); materialize it as a temp file for the DOCX engine.
+    with temp_docx_file(loa_template_bytes(template, storage=storage)) as template_path:
+        return generate_from_template(
+            template_path,
+            output_dir / f"{output_stem}.docx",
+            values,
+            output_pdf=output_dir / f"{output_stem}.pdf",
+            # Preview documents have no persisted verification record and therefore
+            # must not contain a fake or refresh-dependent verification QR.
+            qr_url=(verification_url(verification_token) if submission.journal.loa_qr_enabled and verification_token else None),
+            qr_size_mm=submission.journal.loa_qr_size_mm,
+            qr_placement=submission.journal.loa_qr_placement,
+            qr_label="Scan to Verify LoA",
+        )
 
 
 def generate_loa_preview(

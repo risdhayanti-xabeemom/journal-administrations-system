@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import uuid
 import io
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -68,6 +69,23 @@ class GeneratedLoA:
     @property
     def overflow(self) -> bool:
         return bool(self.page_count and self.page_count > 1)
+
+
+@contextmanager
+def temp_docx_file(content: bytes):
+    """Materialize DOCX bytes as a real closed file for tools (LibreOffice, Word) that need a path.
+
+    Uses mkstemp/os.fdopen rather than NamedTemporaryFile so the file is fully closed
+    before another process (the PDF converter) opens it; NamedTemporaryFile stays open
+    and Windows refuses a second handle on the same file.
+    """
+    descriptor, name = tempfile.mkstemp(suffix=".docx")
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(content)
+        yield Path(name)
+    finally:
+        Path(name).unlink(missing_ok=True)
 
 
 def sha256_file(path: str | Path) -> str:

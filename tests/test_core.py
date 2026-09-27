@@ -35,7 +35,8 @@ from services.core import (
     record_manual_payment, update_editorial_status, update_publication_status, validate_payment_upload,
     verify_password, verify_payment,
 )
-from services.docx_templates import GeneratedLoA, extract_placeholders, generate_from_template
+from services.docx_templates import GeneratedLoA, PDFConverterUnavailable, extract_placeholders, generate_from_template
+from services.revision_storage import LocalRevisionStorage
 from services.template_service import active_loa_template, upload_loa_template
 
 
@@ -85,6 +86,10 @@ def records(session):
         Author(submission_id=submission.id, name="A. Author", email=submission.email, affiliation="Example University", is_corresponding=True, position=1),
         Author(submission_id=submission.id, name="B. Author", affiliation="Second University", is_corresponding=False, position=2),
     ])
+    # storage_path is a raw filesystem path here, not a private-Storage key: every test using this
+    # fixture mocks LoA rendering via fake_loa_renderer (or never generates a LoA at all), so this
+    # row is never read through get_revision_storage(). A real generation path is exercised by
+    # test_generate_template_loa_reads_master_template_from_private_storage below.
     template = DocumentTemplate(
         journal_id=journal.id, template_type="LOA", original_filename=JASENS_TEMPLATE.name,
         storage_path=str(JASENS_TEMPLATE), version=1, status=TemplateStatus.ACTIVE,
@@ -147,18 +152,54 @@ def test_numbering_roman_months_and_year_rollover(session, records):
     assert next_year == "001/SK/TEST/I/2027"
 
 
-def test_template_upload_versions_and_retains_previous(session):
+def test_template_upload_versions_and_retains_previous(session, tmp_path):
+    store = LocalRevisionStorage(tmp_path / "private")
     journal = Journal(name="JASENS", abbreviation="JASENS", currency="IDR")
     user = User(email="owner@example.test", display_name="Owner", password_hash=hash_password("long secure password"), role=Role.SUPER_ADMIN)
     session.add_all([journal, user])
     session.flush()
-    first = upload_loa_template(session, journal, user, original_filename="jasens-v1.docx", content=JASENS_TEMPLATE.read_bytes())
-    second = upload_loa_template(session, journal, user, original_filename="jasens-v2.docx", content=JASENS_TEMPLATE.read_bytes())
+    first = upload_loa_template(session, journal, user, original_filename="jasens-v1.docx",
+        content=JASENS_TEMPLATE.read_bytes(), storage=store)
+    second = upload_loa_template(session, journal, user, original_filename="jasens-v2.docx",
+        content=JASENS_TEMPLATE.read_bytes(), storage=store)
     session.commit()
     assert first.version == 1 and second.version == 2
     assert first.status == TemplateStatus.INACTIVE and second.status == TemplateStatus.ACTIVE
-    assert Path(first.storage_path).is_file() and Path(second.storage_path).is_file()
+    # The master template is retained in private Storage (not local disk, which
+    # Streamlit Cloud wipes on every reboot/redeploy) and both versions are kept.
+    assert store.read(first.storage_path) == JASENS_TEMPLATE.read_bytes()
+    assert store.read(second.storage_path) == JASENS_TEMPLATE.read_bytes()
     assert active_loa_template(session, journal.id).id == second.id
+
+
+def test_generate_template_loa_reads_master_template_from_private_storage(session, records, tmp_path, monkeypatch):
+    """End-to-end (not mocked): the master template is fetched from private Storage, not local disk."""
+    import services.docx_templates as docx_templates_module
+
+    journal, user, submission = records
+    store = LocalRevisionStorage(tmp_path / "private")
+    template = upload_loa_template(session, journal, user, original_filename="jasens.docx",
+        content=JASENS_TEMPLATE.read_bytes(), storage=store)
+    session.commit()
+    assert active_loa_template(session, journal.id).id == template.id
+
+    # Force a deterministic, environment-independent failure at the PDF stage only
+    # (Settings is a frozen dataclass, so the module's own settings reference is
+    # swapped for the duration of the test), so this test never depends on a PDF
+    # converter being installed. The DOCX itself is fully generated — from the
+    # Storage-backed master template — before that failure.
+    monkeypatch.setattr(docx_templates_module, "settings", replace(settings, docx_pdf_converter="none"))
+    with pytest.raises(PDFConverterUnavailable) as excinfo:
+        core._generate_template_loa(
+            template, submission, document_number="04/IX/JASENS/2027",
+            printed_date=date(2027, 9, 1), output_stem=f"storage-real-loa-{template.id}",
+            storage=store,
+        )
+    docx_path = excinfo.value.docx_path
+    assert docx_path is not None and docx_path.is_file()
+    text = package_text(docx_path)
+    assert "04/IX/JASENS/2027" in text and "A. Author" in text and submission.manuscript_title in text
+    assert not extract_placeholders(docx_path)
 
 
 def test_elkolind_dynamic_replacement_and_static_editor_preserved(tmp_path):

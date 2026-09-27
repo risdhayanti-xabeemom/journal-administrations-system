@@ -77,6 +77,7 @@ from services.docx_templates import PDFConversionError, PDFConverterUnavailable,
 from services.template_service import (
     activate_loa_template,
     active_loa_template,
+    loa_template_bytes,
     preview_master_template,
     save_field_mapping,
     upload_loa_template,
@@ -1345,12 +1346,15 @@ def templates_page(session, journal: Journal, user: User) -> None:
             ("Checksum", current.checksum),
         ], columns=["Field", "Value"]).set_index("Field"))
         actions = st.columns(3)
-        actions[0].download_button(
-            "Download Current Template",
-            Path(current.storage_path).read_bytes(),
-            file_name=current.original_filename,
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        )
+        try:
+            actions[0].download_button(
+                "Download Current Template",
+                loa_template_bytes(current),
+                file_name=current.original_filename,
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        except Exception as exc:
+            actions[0].error(str(exc))
         if actions[1].button("Preview Template"):
             try:
                 preview = preview_master_template(session, current, user)
@@ -1414,7 +1418,10 @@ def templates_page(session, journal: Journal, user: User) -> None:
                 cols = st.columns([3, 1, 1, 1])
                 cols[0].write(f"**v{template.version} · {template.original_filename}**  \n{template.uploaded_at}")
                 cols[1].write(template.status.value)
-                cols[2].download_button("DOCX", Path(template.storage_path).read_bytes(), file_name=template.original_filename, mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document", key=f"template-dl-{template.id}")
+                try:
+                    cols[2].download_button("DOCX", loa_template_bytes(template), file_name=template.original_filename, mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document", key=f"template-dl-{template.id}")
+                except Exception as exc:
+                    cols[2].error(str(exc))
                 if template.status.value != "ACTIVE" and cols[3].button("Restore", key=f"restore-template-{template.id}"):
                     try:
                         activate_loa_template(session, template, user)
