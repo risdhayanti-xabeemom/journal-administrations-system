@@ -34,6 +34,7 @@ from models import (
     Receipt,
     Role,
     Submission,
+    SubmissionReviewer,
     User,
     UserJournal,
 )
@@ -96,6 +97,13 @@ from services.ojs_import import (
     metadata_flag,
     preview_table,
     read_import_file,
+)
+from services.ojs_reviews import (
+    build_review_preview,
+    confirm_review_import,
+    detect_review_columns,
+    missing_review_columns,
+    review_preview_table,
 )
 
 
@@ -314,6 +322,7 @@ def submission_rows(items: list[Submission]) -> pd.DataFrame:
                 "OJS ID": item.ojs_submission_id or "Manual",
                 "Title": item.manuscript_title,
                 "Corresponding author": item.corresponding_author,
+                "Reviewers": "; ".join(getattr(item, "_ui_reviewers", [])),
                 "Metadata": "INCOMPLETE_METADATA" if metadata_flag(item.notes) else "READY",
                 "Editorial": item.editorial_status.value,
                 "Financial": next((inv.status.value for inv in sorted(item_invoices(item), key=lambda x: x.created_at, reverse=True)), "NOT_INVOICED"),
@@ -368,7 +377,8 @@ def dashboard(session, journal: Journal) -> None:
     status_frame = pd.DataFrame([x.status.value for x in invoices], columns=["Status"])
     if not status_frame.empty:
         st.subheader("Invoice status distribution")
-        st.bar_chart(status_frame.value_counts().rename("Count"))
+        status_counts = status_frame["Status"].value_counts().rename_axis("Status").reset_index(name="Count")
+        st.bar_chart(status_counts, x="Status", y="Count", use_container_width=True)
 
 
 def all_submissions(session, journal: Journal, user: User) -> None:
@@ -393,13 +403,32 @@ def all_submissions(session, journal: Journal, user: User) -> None:
     by_submission: dict[uuid.UUID, list[Invoice]] = {}
     for inv in invoices:
         by_submission.setdefault(inv.submission_id, []).append(inv)
+    reviewers_by_submission: dict[uuid.UUID, list[str]] = {}
+    if user.role in (Role.SUPER_ADMIN, Role.JOURNAL_ADMIN):
+        for reviewed_id, reviewer_name in session.execute(
+            select(SubmissionReviewer.submission_id, SubmissionReviewer.reviewer_name)
+            .join(Submission, Submission.id == SubmissionReviewer.submission_id)
+            .where(Submission.journal_id == journal.id)
+            .order_by(SubmissionReviewer.review_round, SubmissionReviewer.reviewer_name)
+        ).all():
+            names = reviewers_by_submission.setdefault(reviewed_id, [])
+            if reviewer_name not in names:
+                names.append(reviewer_name)
     for item in items:
         item._ui_invoices = by_submission.get(item.id, [])
+        item._ui_reviewers = reviewers_by_submission.get(item.id, [])
     st.dataframe(submission_rows(items), use_container_width=True, hide_index=True)
     if not items:
         return
     selected_id = st.selectbox("Select submission to update", [str(x.id) for x in items], format_func=lambda value: next(f"{x.ojs_submission_id or 'Manual'} · {x.manuscript_title[:80]}" for x in items if str(x.id) == value))
     selected = next(x for x in items if str(x.id) == selected_id)
+    if user.role in (Role.SUPER_ADMIN, Role.JOURNAL_ADMIN) and selected.reviewers:
+        with st.expander(f"Reviewers ({len(selected.reviewers)})", expanded=False):
+            st.dataframe(pd.DataFrame([
+                {"Round": r.review_round, "Reviewer": r.reviewer_name, "OJS username": r.ojs_reviewer, "State": r.review_state,
+                 "Recommendation": r.recommendation or "", "Assigned": r.date_assigned, "Completed": r.date_completed}
+                for r in sorted(selected.reviewers, key=lambda r: (r.review_round, r.reviewer_name))
+            ]), use_container_width=True, hide_index=True)
     with st.expander("Editorial and metadata update", expanded=False):
         st.caption("Editorial state is independent from payment and publication state.")
         target = st.selectbox("Editorial status", [x.value for x in EditorialStatus], index=list(EditorialStatus).index(selected.editorial_status))
@@ -486,6 +515,70 @@ def import_submissions(session, journal: Journal, user: User) -> None:
     except AuthorizationError as exc:
         st.error(str(exc))
         return
+    articles_tab, reviews_tab = st.tabs(["Articles report", "Review report (reviewer names)"])
+    with articles_tab:
+        import_articles_report(session, journal, user)
+    with reviews_tab:
+        import_review_report(session, journal, user)
+
+
+def import_review_report(session, journal: Journal, user: User) -> None:
+    st.caption(
+        "Upload the OJS review report after the articles report. Rows are matched to submissions by OJS Submission ID. "
+        "Only reviewer name, OJS username, round, state, recommendation, and two dates are saved; "
+        "reviewer e-mail addresses and review comments are ignored."
+    )
+    uploaded = st.file_uploader("OJS review report (CSV or XLSX)", type=["csv", "xlsx"], key=f"ojs-review-file-{journal.id}")
+    if not uploaded:
+        return
+    try:
+        content = uploaded.getvalue()
+        table = read_import_file(uploaded.name, content)
+    except ImportFileError as exc:
+        st.error(str(exc))
+        return
+    file_key = hashlib.sha256(content).hexdigest()[:16]
+    mapping, warnings = detect_review_columns(table.headers)
+    missing = missing_review_columns(mapping)
+    if missing:
+        st.error("This does not look like an OJS review report. Missing column(s): " + ", ".join(missing) + ".")
+        return
+    for field, message in warnings.items():
+        st.warning(f"{field}: {message}")
+    check_titles = st.checkbox(
+        "Check that titles match the submission with the same OJS ID", value=True, key=f"ojs-review-titles-{journal.id}-{file_key}",
+        help="Protects against uploading another journal's report. Rows whose title shares less than half its words with the JAS title are skipped.",
+    )
+    try:
+        preview = build_review_preview(session, journal, table, mapping, check_titles=check_titles)
+    except ValueError as exc:
+        st.error(str(exc))
+        return
+    counts = pd.Series([f"{row.status} / {row.action}" for row in preview]).value_counts()
+    st.subheader("Review import preview — no database changes yet")
+    st.caption(" · ".join(f"{label}: {count}" for label, count in counts.items()) or "No data rows found in this report.")
+    st.dataframe(review_preview_table(preview), use_container_width=True, hide_index=True)
+    if not preview:
+        return
+    if st.button("Confirm review import", type="primary", key=f"ojs-review-confirm-{journal.id}-{file_key}"):
+        try:
+            st.session_state[f"ojs-review-result-{journal.id}-{file_key}"] = confirm_review_import(
+                session, journal, user, table, mapping, uploaded.name, check_titles=check_titles)
+        except Exception as exc:
+            session.rollback()
+            notice_error(exc)
+    result = st.session_state.get(f"ojs-review-result-{journal.id}-{file_key}")
+    if result:
+        st.success(
+            f"Added: {result.added} · Updated: {result.updated} · Unchanged: {result.unchanged} · "
+            f"Submission not found: {result.not_found} · Title mismatch: {result.title_mismatch} · "
+            f"Duplicates: {result.duplicates} · Invalid: {result.invalid}"
+        )
+        st.download_button("Download review import report", error_report_csv(result),
+                           file_name="ojs_review_import_report.csv", mime="text/csv", key=f"ojs-review-report-{journal.id}-{file_key}")
+
+
+def import_articles_report(session, journal: Journal, user: User) -> None:
     st.caption("Required data: OJS Submission ID and Manuscript Title. Other metadata can be completed after import.")
     uploaded = st.file_uploader("OJS CSV or XLSX report", type=["csv", "xlsx"])
     if not uploaded:
@@ -533,8 +626,18 @@ def import_submissions(session, journal: Journal, user: User) -> None:
         return
     policy = st.radio("Existing submissions", ["Skip existing", "Update existing metadata"], horizontal=True,
                       help="Updates only unprotected descriptive metadata. Accepted, publication, LoA, invoice, and payment information is never overwritten.")
+    sync_status = st.checkbox(
+        "Complete editorial and publication status of existing submissions from OJS", value=True, key=f"ojs-sync-status-{journal.id}-{file_key}",
+        help="Forward-only: SUBMITTED or UNDER_REVIEW records can move to the OJS stage, and an accepted record becomes PUBLISHED when OJS says Published. "
+             "Records that already have an LoA or invoice, and records that are rejected or withdrawn, are never changed.",
+    )
+    fill_blanks = st.checkbox(
+        "Fill missing author details of existing submissions from OJS", value=True, key=f"ojs-fill-blanks-{journal.id}-{file_key}",
+        help="Fills only empty corresponding author, e-mail, affiliation, and author list, including on accepted or published records. "
+             "Anything already filled in JAS is never overwritten. The first author in the OJS report is used as the corresponding author.",
+    )
     try:
-        preview = build_preview(session, journal, table, mapping, update_existing=policy == "Update existing metadata")
+        preview = build_preview(session, journal, table, mapping, update_existing=policy == "Update existing metadata", sync_status=sync_status, fill_blanks=fill_blanks)
     except ValueError as exc:
         st.error(str(exc))
         return
@@ -546,7 +649,7 @@ def import_submissions(session, journal: Journal, user: User) -> None:
     if st.button("Confirm Import", type="primary"):
         try:
             result = confirm_import(session, journal, user, table, mapping, uploaded.name,
-                                    update_existing=policy == "Update existing metadata")
+                                    update_existing=policy == "Update existing metadata", sync_status=sync_status, fill_blanks=fill_blanks)
             st.session_state[f"ojs-import-result-{journal.id}-{file_key}"] = result
         except Exception as exc:
             session.rollback()
@@ -554,7 +657,7 @@ def import_submissions(session, journal: Journal, user: User) -> None:
     result = st.session_state.get(f"ojs-import-result-{journal.id}-{file_key}")
     if result:
         st.success(f"Imported: {result.imported} · Skipped duplicates: {result.skipped_duplicates} · "
-                   f"Updated: {result.updated} · Incomplete: {result.incomplete} · Invalid: {result.invalid}")
+                   f"Updated: {result.updated} (status completed: {result.status_updated}, details filled: {result.filled}) · Incomplete: {result.incomplete} · Invalid: {result.invalid}")
         st.download_button("Download import error report", error_report_csv(result),
                            file_name="ojs_import_errors.csv", mime="text/csv")
 

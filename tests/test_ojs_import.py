@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import io
+import uuid
+from datetime import date
 
 import pytest
 from openpyxl import Workbook
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session
 
-from models import AuditLog, Author, Base, EditorialStatus, Journal, PublicationStatus, Role, Submission, User
+from models import AuditLog, Author, Base, EditorialStatus, Journal, LoADocument, PublicationStatus, Role, Submission, User
 from services.ojs_import import (
     INCOMPLETE_MARKER,
     ImportFileError,
@@ -209,3 +211,121 @@ def test_partial_valid_invalid_duplicate_file_and_audit(records):
     assert [author.name for author in session.scalar(select(Submission).where(Submission.ojs_submission_id == "1563")).authors] == ["Alpha", "Beta"]
     audit = session.scalar(select(AuditLog).where(AuditLog.action == "SUBMISSION_IMPORT_BATCH"))
     assert '"total_rows": 4' in audit.new_value and '"invalid_rows": 1' in audit.new_value
+
+
+def test_ojs_publication_stages_import_with_status_publication_and_decision_date(records):
+    session, journal, _, user = records
+    table = csv_table(
+        "Submission ID,Title,Status,Date submitted,Editor Decision 1  (Editor 1),Date decided 1  (Editor 1),Editor Decision 2  (Editor 1),Date decided 2  (Editor 1)\n"
+        "2001,Published paper,Published,2024-01-05 10:00:00,Send to Review,2024-01-10 10:00:00,Accept Submission,2024-02-01 09:30:00\n"
+        "2002,In production,Production,2024-01-06 10:00:00,Accept Submission,2024-03-01 09:30:00,,\n"
+        "2003,Still in review,Review,2024-01-07 10:00:00,Send to Review,2024-01-12 10:00:00,,\n"
+        "2004,Declined paper,Declined,2024-01-08 10:00:00,Decline Submission,2024-01-20 10:00:00,,\n"
+    )
+    mapping = required_mapping(table)
+    preview = build_preview(session, journal, table, mapping)
+    assert not any("Unrecognized editorial status" in issue for row in preview for issue in row.issues)
+    result = confirm_import(session, journal, user, table, mapping, "ojs.csv")
+    assert result.imported == 4
+    items = {item.ojs_submission_id: item for item in session.scalars(select(Submission))}
+    assert (items["2001"].editorial_status, items["2001"].publication_status) == (EditorialStatus.ACCEPTED, PublicationStatus.PUBLISHED)
+    assert items["2001"].date_accepted == date(2024, 2, 1)
+    assert (items["2002"].editorial_status, items["2002"].publication_status) == (EditorialStatus.ACCEPTED, PublicationStatus.NOT_READY)
+    assert items["2002"].date_accepted == date(2024, 3, 1)
+    assert (items["2003"].editorial_status, items["2003"].date_accepted) == (EditorialStatus.UNDER_REVIEW, None)
+    assert (items["2004"].editorial_status, items["2004"].date_accepted) == (EditorialStatus.REJECTED, None)
+
+
+def test_status_sync_completes_existing_records_forward_only_and_respects_documents(records):
+    session, journal, _, user = records
+
+    def seed(ojs_id, **extra):
+        item = Submission(journal_id=journal.id, ojs_submission_id=ojs_id, manuscript_title=f"Paper {ojs_id}", corresponding_author="", email="", **extra)
+        session.add(item)
+        return item
+
+    plain, locked = seed("3001"), seed("3002")
+    rejected, in_review = seed("3003", editorial_status=EditorialStatus.REJECTED), seed("3004")
+    session.commit()
+    session.add(LoADocument(journal_id=journal.id, submission_id=locked.id, verification_id=uuid.uuid4(), document_number="LOCK/3002", issue_date=date(2026, 1, 1)))
+    session.commit()
+    table = csv_table(
+        "Submission ID,Title,Status,Editor Decision 1  (Editor 1),Date decided 1  (Editor 1)\n"
+        "3001,Paper 3001,Published,Accept Submission,2024-02-01 09:00:00\n"
+        "3002,Paper 3002,Published,Accept Submission,2024-02-01 09:00:00\n"
+        "3003,Paper 3003,Published,Accept Submission,2024-02-01 09:00:00\n"
+        "3004,Paper 3004,Review,,\n"
+    )
+    mapping = required_mapping(table)
+    assert [row.action for row in build_preview(session, journal, table, mapping)] == ["SKIP"] * 4
+
+    preview = build_preview(session, journal, table, mapping, sync_status=True)
+    assert [row.action for row in preview] == ["COMPLETE", "SKIP", "SKIP", "COMPLETE"]
+    assert "SUBMITTED → ACCEPTED" in preview[0].info[0]
+
+    result = confirm_import(session, journal, user, table, mapping, "ojs.csv", sync_status=True)
+    assert (result.updated, result.status_updated, result.skipped_duplicates, result.incomplete) == (2, 2, 2, 0)
+    assert (plain.editorial_status, plain.publication_status, plain.date_accepted) == (EditorialStatus.ACCEPTED, PublicationStatus.PUBLISHED, date(2024, 2, 1))
+    assert (locked.editorial_status, locked.publication_status) == (EditorialStatus.SUBMITTED, PublicationStatus.NOT_READY)
+    assert rejected.editorial_status == EditorialStatus.REJECTED
+    assert in_review.editorial_status == EditorialStatus.UNDER_REVIEW
+    assert session.scalar(select(func.count(AuditLog.id)).where(AuditLog.action == "SUBMISSION_IMPORT_COMPLETED")) == 2
+
+    again = confirm_import(session, journal, user, table, mapping, "ojs.csv", sync_status=True)
+    assert (again.updated, again.status_updated) == (0, 0)
+
+
+AUTHOR_HEADER = (
+    "Submission ID,Title,Given Name (Author 1),Family Name (Author 1),Email (Author 1),Affiliation (Author 1),"
+    "Given Name (Author 2),Family Name (Author 2),Email (Author 2),Affiliation (Author 2)\n"
+)
+
+
+def test_ojs_author_columns_fill_authors_corresponding_author_and_email(records):
+    session, journal, _, user = records
+    table = csv_table(
+        AUTHOR_HEADER
+        + "4001,Two authors,Ada,Lovelace,ADA@example.test,Polinema,Bima,,bima@example.test,\n"
+        + "4002,One author,Citra,Dewi,citra@example.test,,,,,\n"
+    )
+    mapping = required_mapping(table)
+    preview = build_preview(session, journal, table, mapping)
+    assert not any(issue in ("Missing authors.", "Missing corresponding_author.", "Missing email.") for row in preview for issue in row.issues)
+    assert confirm_import(session, journal, user, table, mapping, "ojs.csv").imported == 2
+    two = session.scalar(select(Submission).where(Submission.ojs_submission_id == "4001"))
+    assert (two.corresponding_author, two.email, two.affiliation) == ("Ada Lovelace", "ada@example.test", "Polinema")
+    assert [(a.name, a.is_corresponding, a.email) for a in two.authors] == [
+        ("Ada Lovelace", True, "ada@example.test"), ("Bima", False, "bima@example.test"),
+    ]
+    one = session.scalar(select(Submission).where(Submission.ojs_submission_id == "4002"))
+    assert (one.corresponding_author, one.affiliation, [a.name for a in one.authors]) == ("Citra Dewi", None, ["Citra Dewi"])
+
+
+def test_fill_blanks_completes_empty_author_fields_on_accepted_records_without_overwriting(records):
+    session, journal, _, user = records
+    empty = Submission(journal_id=journal.id, ojs_submission_id="4101", manuscript_title="Accepted paper", corresponding_author="", email="",
+                       editorial_status=EditorialStatus.ACCEPTED, publication_status=PublicationStatus.PUBLISHED)
+    filled = Submission(journal_id=journal.id, ojs_submission_id="4102", manuscript_title="Other paper", corresponding_author="Existing Person",
+                        email="existing@example.test", affiliation="Old Univ")
+    session.add_all([empty, filled])
+    session.commit()
+    session.add(Author(submission_id=filled.id, name="Existing Person", position=1, is_corresponding=True))
+    session.commit()
+    table = csv_table(
+        AUTHOR_HEADER
+        + "4101,Accepted paper,Ada,Lovelace,ada@example.test,Polinema,,,,\n"
+        + "4102,Other paper,Citra,Dewi,citra@example.test,New Univ,,,,\n"
+    )
+    mapping = required_mapping(table)
+    assert [row.action for row in build_preview(session, journal, table, mapping)] == ["SKIP", "SKIP"]
+    preview = build_preview(session, journal, table, mapping, fill_blanks=True)
+    assert [row.action for row in preview] == ["COMPLETE", "SKIP"]
+    result = confirm_import(session, journal, user, table, mapping, "ojs.csv", fill_blanks=True)
+    assert (result.updated, result.filled, result.status_updated, result.skipped_duplicates) == (1, 1, 0, 1)
+    assert (empty.corresponding_author, empty.email, empty.affiliation) == ("Ada Lovelace", "ada@example.test", "Polinema")
+    assert [a.name for a in empty.authors] == ["Ada Lovelace"]
+    assert (empty.editorial_status, empty.publication_status) == (EditorialStatus.ACCEPTED, PublicationStatus.PUBLISHED)
+    assert (filled.corresponding_author, filled.email, filled.affiliation) == ("Existing Person", "existing@example.test", "Old Univ")
+    assert [a.name for a in filled.authors] == ["Existing Person"]
+    again = confirm_import(session, journal, user, table, mapping, "ojs.csv", fill_blanks=True)
+    assert (again.updated, again.filled) == (0, 0)

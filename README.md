@@ -30,6 +30,8 @@ services/
   core.py                      auth, authorization, workflow, numbering,
                                PDF/QR, payment, verification, reports, audit
   ojs_import.py                alias mapping, CSV/XLSX preview, partial import
+  ojs_status.py                OJS status mapping, accepted-date derivation, review helpers (pure)
+  ojs_reviews.py               OJS review report import (reviewer names)
   ojs_service.py               future OJS adapter contract
 migrations/001_initial_postgresql.sql
 scripts/init_db.py
@@ -191,7 +193,15 @@ Pratinjau menampilkan `READY`, `DUPLICATE`, `MISSING_REQUIRED_FIELD`, `INCOMPLET
 
 Duplikasi diperiksa dengan pasangan `journal_id + ojs_submission_id`. `Skip existing` adalah pilihan awal. `Update existing metadata` hanya memperbarui metadata deskriptif pada submission yang belum berstatus accepted/published dan belum memiliki LoA atau invoice. Urutan penulis dari OJS dipertahankan; pemisah `;` atau baris baru dianggap jelas, sedangkan daftar penulis yang ambigu disimpan mentah dan ditandai untuk pemeriksaan. HTML entity didekode, tag HTML tidak dirender, dan impor dicatat dalam audit log per baris serta per batch tanpa path lokal.
 
-Tidak ada perubahan skema database atau dependensi baru untuk revisi impor ini. Lihat [OJS_IMPORT_UPGRADE.md](OJS_IMPORT_UPGRADE.md) untuk langkah upgrade dan push.
+Kolom `Status` OJS dipetakan ke status JAS: `Review` → UNDER_REVIEW; `Copyediting`, `Production`, `Scheduled` → ACCEPTED; `Published` → ACCEPTED dan PUBLISHED; `Declined` → REJECTED. Tanggal accepted diambil dari keputusan editor "Accept Submission" paling awal bila laporan memuatnya. Opsi *Complete editorial and publication status of existing submissions from OJS* melengkapi status submission yang sudah ada, hanya maju (tidak pernah mundur) dan tidak menyentuh submission yang sudah memiliki LoA atau invoice.
+
+Penulis dibaca dari kolom `Given Name / Family Name / Email / Affiliation (Author N)`: penulis pertama menjadi corresponding author beserta email dan afiliasinya, dan semua penulis tersimpan berurutan. Opsi *Fill missing author details of existing submissions from OJS* hanya mengisi kolom yang masih kosong pada submission yang sudah ada (termasuk yang accepted/published) dan tidak pernah menimpa data yang sudah terisi.
+
+### Laporan review (nama reviewer)
+
+Tab `Review report (reviewer names)` pada halaman yang sama mengimpor laporan review OJS setelah laporan artikel. Baris dicocokkan lewat OJS Submission ID pada jurnal aktif, dan judulnya diperiksa agar laporan jurnal lain tidak tersimpan ke submission yang salah. Hanya nama reviewer, username OJS, putaran, status, rekomendasi, dan dua tanggal yang disimpan; email reviewer dan komentar review diabaikan. Data tersimpan di tabel baru `submission_reviewers` (dibuat otomatis, atau jalankan `migrations/003_submission_reviewers.sql`) dan hanya tampil untuk SUPER_ADMIN dan JOURNAL_ADMIN. Mengimpor ulang file yang sama tidak membuat duplikat.
+
+Tidak ada dependensi baru. Lihat [OJS_IMPORT_UPGRADE.md](OJS_IMPORT_UPGRADE.md) untuk langkah upgrade dan push.
 
 Langkah smoke test manual:
 
