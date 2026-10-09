@@ -163,6 +163,28 @@ class Submission(Base):
 
     journal: Mapped[Journal] = relationship()
     authors: Mapped[list[Author]] = relationship(back_populates="submission", cascade="all, delete-orphan", order_by="Author.position")
+    reviewers: Mapped[list[SubmissionReviewer]] = relationship(back_populates="submission", cascade="all, delete-orphan", order_by="SubmissionReviewer.review_round")
+
+
+class SubmissionReviewer(Base):
+    """One reviewer assignment from the OJS review report (name and outcome only, no review text)."""
+
+    __tablename__ = "submission_reviewers"
+    __table_args__ = (UniqueConstraint("submission_id", "review_round", "ojs_reviewer", name="uq_submission_reviewer_round"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(GUID(), primary_key=True, default=uuid.uuid4)
+    submission_id: Mapped[uuid.UUID] = mapped_column(GUID(), ForeignKey("submissions.id", ondelete="CASCADE"), index=True)
+    reviewer_name: Mapped[str] = mapped_column(String(255))
+    ojs_reviewer: Mapped[str] = mapped_column(String(128))
+    review_round: Mapped[int] = mapped_column(Integer, default=1)
+    review_state: Mapped[str] = mapped_column(String(16), default="PENDING")
+    recommendation: Mapped[str | None] = mapped_column(String(64))
+    date_assigned: Mapped[date | None] = mapped_column(Date)
+    date_completed: Mapped[date | None] = mapped_column(Date)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+    submission: Mapped[Submission] = relationship(back_populates="reviewers")
 
 
 class Author(Base):

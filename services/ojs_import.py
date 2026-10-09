@@ -7,7 +7,7 @@ import io
 import re
 import uuid
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date
 from html import unescape
 from html.parser import HTMLParser
 
@@ -18,6 +18,13 @@ from sqlalchemy.orm import Session
 
 from models import Author, EditorialStatus, Invoice, Journal, LoADocument, PublicationStatus, Submission, User
 from services.core import assert_journal_access, log_audit
+from services.ojs_status import (
+    accepted_date_from_decisions,
+    editorial_move_allowed,
+    find_decision_columns,
+    map_ojs_status,
+    parse_date,
+)
 from models import Role
 
 
@@ -111,6 +118,10 @@ class PreviewRow:
     parsed_dates: dict[str, date | None] = field(default_factory=dict)
     parsed_year: int | None = None
     editorial_status: EditorialStatus = EditorialStatus.SUBMITTED
+    publication_status: PublicationStatus = PublicationStatus.NOT_READY
+    # Status fields OJS will complete on an existing record, and plain-language notes about them.
+    status_changes: dict[str, object] = field(default_factory=dict)
+    info: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -119,6 +130,7 @@ class ImportResult:
     imported: int = 0
     skipped_duplicates: int = 0
     updated: int = 0
+    status_updated: int = 0
     incomplete: int = 0
     invalid: int = 0
     errors: list[dict[str, str | int]] = field(default_factory=list)
@@ -190,16 +202,19 @@ def read_import_file(filename: str, content: bytes) -> ImportTable:
     return ImportTable(headers, tuple(rows))
 
 
-def detect_columns(headers: tuple[str, ...]) -> tuple[dict[str, int | None], dict[str, str]]:
+def detect_columns(
+    headers: tuple[str, ...], field_aliases: dict[str, tuple[str, ...]] | None = None
+) -> tuple[dict[str, int | None], dict[str, str]]:
+    field_aliases = FIELD_ALIASES if field_aliases is None else field_aliases
     normalized = [normalize_column(header) for header in headers]
     candidates = {
         field: [index for index, name in enumerate(normalized) if name in aliases]
-        for field, aliases in FIELD_ALIASES.items()
+        for field, aliases in field_aliases.items()
     }
-    result: dict[str, int | None] = {field: None for field in FIELD_ALIASES}
+    result: dict[str, int | None] = {field: None for field in field_aliases}
     warnings: dict[str, str] = {}
     reserved: set[int] = set()
-    for field in FIELD_ALIASES:
+    for field in field_aliases:
         exact = [index for index in candidates[field] if normalized[index] == field]
         if len(exact) == 1 and normalized.count(field) == 1:
             result[field] = exact[0]
@@ -222,30 +237,18 @@ def detect_columns(headers: tuple[str, ...]) -> tuple[dict[str, int | None], dic
     return result, warnings
 
 
-def _parse_date(value: str) -> date | None:
-    if not value:
-        return None
-    for format_string in ("%Y-%m-%d", "%Y/%m/%d", "%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d %H:%M:%S"):
-        try:
-            return datetime.strptime(value, format_string).date()
-        except ValueError:
-            pass
-    return None
+_parse_date = parse_date
 
 
 def _parse_status(value: str) -> EditorialStatus | None:
-    aliases = {
-        "submitted": EditorialStatus.SUBMITTED,
-        "submission": EditorialStatus.SUBMITTED,
-        "under_review": EditorialStatus.UNDER_REVIEW,
-        "in_review": EditorialStatus.UNDER_REVIEW,
-        "review": EditorialStatus.UNDER_REVIEW,
-        "accepted": EditorialStatus.ACCEPTED,
-        "rejected": EditorialStatus.REJECTED,
-        "declined": EditorialStatus.REJECTED,
-        "withdrawn": EditorialStatus.WITHDRAWN,
-    }
-    return aliases.get(normalize_column(value)) if value else None
+    editorial, _ = map_ojs_status(value)
+    return EditorialStatus[editorial] if editorial else None
+
+
+def _parse_publication(value: str) -> PublicationStatus | None:
+    """OJS "Published" also means the article is published; later stages stay NOT_READY."""
+    _, publication = map_ojs_status(value)
+    return PublicationStatus[publication] if publication else None
 
 
 def _authors(value: str) -> tuple[list[str], bool]:
@@ -273,14 +276,56 @@ def _notes(source: str, issues: list[str], raw_authors: str = "") -> str | None:
     return marker + ("\n" + existing if existing else "")
 
 
+def _has_documents(session: Session, submission: Submission) -> bool:
+    return bool(
+        session.scalar(select(LoADocument.id).where(LoADocument.submission_id == submission.id))
+        or session.scalar(select(Invoice.id).where(Invoice.submission_id == submission.id))
+    )
+
+
 def _protected(session: Session, submission: Submission) -> bool:
     return bool(
         submission.editorial_status == EditorialStatus.ACCEPTED
         or submission.date_accepted
         or submission.publication_status != PublicationStatus.NOT_READY
-        or session.scalar(select(LoADocument.id).where(LoADocument.submission_id == submission.id))
-        or session.scalar(select(Invoice.id).where(Invoice.submission_id == submission.id))
+        or _has_documents(session, submission)
     )
+
+
+def _status_changes(
+    session: Session,
+    submission: Submission,
+    editorial: EditorialStatus | None,
+    publication: PublicationStatus | None,
+    accepted: date | None,
+) -> dict[str, object]:
+    """Status fields OJS may complete on an existing record. Forward-only.
+
+    Records that already have an LoA or invoice are never touched, and accepted,
+    rejected, or withdrawn records never move back to an earlier stage.
+    """
+    if editorial is None or _has_documents(session, submission):
+        return {}
+    changes: dict[str, object] = {}
+    if editorial != submission.editorial_status and editorial_move_allowed(submission.editorial_status.value, editorial.value):
+        changes["editorial_status"] = editorial
+    effective = changes.get("editorial_status", submission.editorial_status)
+    if effective == EditorialStatus.ACCEPTED:
+        if publication == PublicationStatus.PUBLISHED and submission.publication_status == PublicationStatus.NOT_READY:
+            changes["publication_status"] = PublicationStatus.PUBLISHED
+        if accepted and submission.date_accepted is None:
+            changes["date_accepted"] = accepted
+    return changes
+
+
+def _describe_changes(submission: Submission, changes: dict[str, object]) -> str:
+    labels = {"editorial_status": "Editorial", "publication_status": "Publication", "date_accepted": "Date accepted"}
+    parts = []
+    for key, value in changes.items():
+        before = getattr(submission, key)
+        before_text = before.value if hasattr(before, "value") else (before or "-")
+        parts.append(f"{labels[key]} {before_text} → {value.value if hasattr(value, 'value') else value}")
+    return "; ".join(parts)
 
 
 def build_preview(
@@ -290,6 +335,7 @@ def build_preview(
     mapping: dict[str, int | None],
     *,
     update_existing: bool = False,
+    sync_status: bool = False,
 ) -> list[PreviewRow]:
     if any(mapping.get(field) is None for field in REQUIRED_FIELDS):
         raise ValueError("Map OJS Submission ID and Manuscript Title before previewing or importing.")
@@ -297,6 +343,7 @@ def build_preview(
         raise ValueError("A mapped source column is outside the uploaded file.")
     seen: set[str] = set()
     output: list[PreviewRow] = []
+    decision_columns = find_decision_columns(table.headers)
     for source in table.rows:
         values = {
             field: clean_text(source.values[index]) if index is not None and index < len(source.values) else ""
@@ -305,9 +352,11 @@ def build_preview(
         values = {field: values.get(field, "") for field in FIELD_ALIASES}
         ojs_id = values["ojs_submission_id"]
         issues: list[str] = []
+        info: list[str] = []
         status = "READY"
         action = "IMPORT"
         existing = None
+        skip_reason = ""
         if source.parse_error:
             status, action = "INVALID_ROW", "SKIP"
             issues.append(source.parse_error)
@@ -329,7 +378,7 @@ def build_preview(
                     action = "UPDATE_METADATA"
                 else:
                     action = "SKIP"
-                    issues.append("Existing submission is protected or duplicate policy is Skip existing.")
+                    skip_reason = "Existing submission is protected or duplicate policy is Skip existing."
         for field in RECOMMENDED_FIELDS:
             if not values[field]:
                 issues.append(f"Missing {field}.")
@@ -352,8 +401,33 @@ def build_preview(
                 issues.append("Invalid publication year.")
                 year = None
         editorial = _parse_status(values["editorial_status"])
+        publication = _parse_publication(values["editorial_status"])
         if values["editorial_status"] and editorial is None:
             issues.append("Unrecognized editorial status; defaulting to SUBMITTED.")
+        if (
+            editorial == EditorialStatus.ACCEPTED
+            and parsed_dates["date_accepted"] is None
+            and not values["date_accepted"]
+            and decision_columns
+        ):
+            # The OJS articles report has no acceptance column; take it from the editor decisions.
+            parsed_dates["date_accepted"] = accepted_date_from_decisions(
+                (
+                    clean_text(source.values[decision]) if decision < len(source.values) else "",
+                    clean_text(source.values[decided]) if decided < len(source.values) else "",
+                )
+                for decision, decided in decision_columns
+            )
+        status_changes: dict[str, object] = {}
+        if existing is not None and sync_status:
+            status_changes = _status_changes(session, existing, editorial, publication, parsed_dates["date_accepted"])
+            if status_changes:
+                info.append("Status update: " + _describe_changes(existing, status_changes))
+                if action == "SKIP":
+                    action = "UPDATE_STATUS"
+                    skip_reason = ""
+        if skip_reason:
+            issues.append(skip_reason)
         author_names, author_review = _authors(values["authors"])
         if author_review:
             issues.append("Author delimiter is uncertain; raw author text retained for review.")
@@ -362,7 +436,10 @@ def build_preview(
             author_names = []
         if status == "READY" and issues:
             status = "INCOMPLETE_METADATA"
-        output.append(PreviewRow(source.number, values, status, action, issues, existing.id if existing else None, author_names, parsed_dates, year, editorial or EditorialStatus.SUBMITTED))
+        output.append(PreviewRow(
+            source.number, values, status, action, issues, existing.id if existing else None, author_names, parsed_dates, year,
+            editorial or EditorialStatus.SUBMITTED, publication or PublicationStatus.NOT_READY, status_changes, info,
+        ))
     return output
 
 
@@ -374,9 +451,11 @@ def preview_table(rows: list[PreviewRow]) -> pd.DataFrame:
             "Manuscript Title": row.values["manuscript_title"],
             "Corresponding Author": row.values["corresponding_author"],
             "Email": row.values["email"],
+            "OJS status": row.values["editorial_status"],
+            "JAS status": row.editorial_status.value + (f" / {row.publication_status.value}" if row.publication_status != PublicationStatus.NOT_READY else ""),
             "Status": row.status,
             "Action": row.action,
-            "Review notes": "; ".join(row.issues),
+            "Review notes": "; ".join([*row.info, *row.issues]),
         }
         for row in rows
     ])
@@ -400,9 +479,10 @@ def confirm_import(
     filename: str,
     *,
     update_existing: bool = False,
+    sync_status: bool = False,
 ) -> ImportResult:
     assert_journal_access(user, journal.id, {Role.SUPER_ADMIN, Role.JOURNAL_ADMIN}, session)
-    rows = build_preview(session, journal, table, mapping, update_existing=update_existing)
+    rows = build_preview(session, journal, table, mapping, update_existing=update_existing, sync_status=sync_status)
     result = ImportResult(total_rows=len(rows))
     for row in rows:
         if row.action == "SKIP":
@@ -415,25 +495,31 @@ def confirm_import(
         try:
             completed_action = row.action
             with session.begin_nested():
-                if row.action == "UPDATE_METADATA":
+                if row.action in ("UPDATE_METADATA", "UPDATE_STATUS"):
+                    metadata = row.action == "UPDATE_METADATA"
                     item = session.get(Submission, row.existing_id)
-                    if item is None or _protected(session, item):
+                    if item is None or (metadata and _protected(session, item)) or (not metadata and _has_documents(session, item)):
                         result.skipped_duplicates += 1
                         result.errors.append({"source_row": row.source_row, "ojs_submission_id": row.values["ojs_submission_id"], "status": "DUPLICATE", "reason": "Existing record became protected or unavailable."})
                         continue
-                    previous = {key: getattr(item, key) for key in ("manuscript_title", "corresponding_author", "email", "affiliation")}
-                    for key in ("manuscript_title", "corresponding_author", "email", "affiliation"):
-                        if row.values[key]:
-                            setattr(item, key, row.values[key].lower() if key == "email" else row.values[key])
-                    if row.parsed_dates["date_submitted"]:
-                        item.date_submitted = row.parsed_dates["date_submitted"]
-                    if row.author_names:
-                        item.authors.clear()
-                        session.flush()
-                        _add_authors(session, item, row)
-                    raw_authors = row.values["authors"] if row.values["authors"] and not row.author_names else ""
-                    item.notes = _notes(row.values["notes"] or item.notes or "", row.issues, raw_authors)
-                    log_audit(session, action="SUBMISSION_IMPORT_UPDATED", object_type="submission", object_id=item.id, user_id=user.id, journal_id=journal.id, previous=previous, new={key: getattr(item, key) for key in previous})
+                    previous: dict[str, object] = {}
+                    if metadata:
+                        previous = {key: getattr(item, key) for key in ("manuscript_title", "corresponding_author", "email", "affiliation")}
+                        for key in ("manuscript_title", "corresponding_author", "email", "affiliation"):
+                            if row.values[key]:
+                                setattr(item, key, row.values[key].lower() if key == "email" else row.values[key])
+                        if row.parsed_dates["date_submitted"]:
+                            item.date_submitted = row.parsed_dates["date_submitted"]
+                        if row.author_names:
+                            item.authors.clear()
+                            session.flush()
+                            _add_authors(session, item, row)
+                        raw_authors = row.values["authors"] if row.values["authors"] and not row.author_names else ""
+                        item.notes = _notes(row.values["notes"] or item.notes or "", row.issues, raw_authors)
+                    for key, value in row.status_changes.items():
+                        previous[key] = getattr(item, key)
+                        setattr(item, key, value)
+                    log_audit(session, action="SUBMISSION_IMPORT_UPDATED" if metadata else "SUBMISSION_IMPORT_STATUS_SYNCED", object_type="submission", object_id=item.id, user_id=user.id, journal_id=journal.id, previous=previous, new={key: getattr(item, key) for key in previous})
                 else:
                     raw_authors = row.values["authors"] if row.values["authors"] and not row.author_names else ""
                     item = Submission(
@@ -441,7 +527,7 @@ def confirm_import(
                         manuscript_title=row.values["manuscript_title"], corresponding_author=row.values["corresponding_author"],
                         email=row.values["email"].lower(), affiliation=row.values["affiliation"] or None,
                         date_submitted=row.parsed_dates["date_submitted"], date_accepted=row.parsed_dates["date_accepted"],
-                        editorial_status=row.editorial_status,
+                        editorial_status=row.editorial_status, publication_status=row.publication_status,
                         planned_volume=row.values["planned_volume"] or journal.default_volume,
                         planned_issue=row.values["planned_issue"] or journal.default_issue,
                         planned_publication_month=row.values["planned_publication_month"] or journal.default_publication_month,
@@ -452,11 +538,14 @@ def confirm_import(
                     session.flush()
                     _add_authors(session, item, row)
                     log_audit(session, action="SUBMISSION_IMPORTED", object_type="submission", object_id=item.id, user_id=user.id, journal_id=journal.id, new={"ojs_submission_id": item.ojs_submission_id, "metadata_status": "INCOMPLETE_METADATA" if row.issues else "READY"})
-            if completed_action == "UPDATE_METADATA":
+            if completed_action in ("UPDATE_METADATA", "UPDATE_STATUS"):
                 result.updated += 1
+                if row.status_changes:
+                    result.status_updated += 1
             else:
                 result.imported += 1
-            if row.issues:
+            # A status-only sync leaves metadata alone, so missing metadata is not reported again.
+            if row.issues and completed_action != "UPDATE_STATUS":
                 result.incomplete += 1
                 result.errors.append({"source_row": row.source_row, "ojs_submission_id": row.values["ojs_submission_id"], "status": "INCOMPLETE_METADATA", "reason": "; ".join(row.issues)})
         except Exception as exc:
@@ -470,7 +559,7 @@ def confirm_import(
     log_audit(session, action="SUBMISSION_IMPORT_BATCH", object_type="submission_import", object_id=uuid.uuid4(), user_id=user.id, journal_id=journal.id,
               new={"filename": safe_filename, "total_rows": result.total_rows, "imported_rows": result.imported,
                    "skipped_rows": result.skipped_duplicates + result.invalid, "skipped_duplicate_rows": result.skipped_duplicates,
-                   "updated_rows": result.updated,
+                   "updated_rows": result.updated, "status_updated_rows": result.status_updated,
                    "invalid_rows": result.invalid, "incomplete_rows": result.incomplete})
     session.commit()
     return result

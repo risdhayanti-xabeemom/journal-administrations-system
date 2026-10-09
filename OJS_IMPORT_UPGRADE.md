@@ -55,3 +55,30 @@ git push origin main
 ```
 
 Deploy the pushed `main` branch using the existing deployment process. Keep the current `DATABASE_URL`, private uploads, templates, and secrets. No Supabase migration or reset is part of this release.
+
+## Review report and status completion (October 2026)
+
+This revision adds reviewer names from the OJS review report and completes editorial/publication status from the OJS articles report.
+
+**What changed**
+
+- `services/ojs_status.py` (new): maps the OJS `Status` column. `Review` → UNDER_REVIEW; `Copyediting`, `Production`, `Scheduled` → ACCEPTED; `Published` → ACCEPTED and PUBLISHED; `Declined` → REJECTED. Previously the last four were "unrecognized" and imported as SUBMITTED.
+- `date_accepted` is filled for accepted articles from the earliest "Accept Submission" editor decision (else "Send To Production"). Articles whose report has no such decision keep an empty acceptance date.
+- `SUBMISSIONS → Import CSV/Excel` now has two tabs. **Articles report** gained the option *Complete editorial and publication status of existing submissions from OJS* (on by default). **Review report (reviewer names)** imports the OJS review export.
+- New table `submission_reviewers` (reviewer name, OJS username, round, state, recommendation, assigned/completed dates). `init_database()` creates it automatically; `migrations/003_submission_reviewers.sql` does the same explicitly. No existing table or row is changed.
+- `SUBMISSIONS → All Submissions` shows a `Reviewers` column and a per-submission reviewer list (SUPER_ADMIN and JOURNAL_ADMIN only).
+
+**Status sync rules (existing records)**
+
+- Forward only: SUBMITTED or UNDER_REVIEW may move to the OJS stage. An ACCEPTED record becomes PUBLISHED when OJS says Published.
+- Records with an LoA or invoice, and records that are REJECTED or WITHDRAWN, are never changed.
+- The preview shows each change (`Editorial SUBMITTED → ACCEPTED; Publication NOT_READY → PUBLISHED`) before you confirm. Re-running the same file changes nothing.
+
+**Review report rules**
+
+- Import the articles report first; review rows are matched to submissions by OJS Submission ID inside the active journal.
+- Reviewer e-mail addresses and review comments are ignored. Only the name, OJS username, round, state (PENDING, IN_PROGRESS, COMPLETED, DECLINED, CANCELLED), recommendation, and two dates are stored.
+- A title check skips rows whose title shares fewer than half its words with the JAS submission, which catches another journal's report uploaded by mistake. It can be switched off in the preview.
+- Re-importing updates changed rows and leaves identical rows alone; nothing is duplicated.
+
+**Upgrade steps**: follow the local upgrade steps above (back up the database, pull the files, run `pytest tests -q -p no:cacheprovider`, restart). Then import the articles report with the new option ticked, and the review report in the second tab.
