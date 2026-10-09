@@ -9,7 +9,9 @@ import pytest
 from services.ojs_status import (
     TITLE_OVERLAP_MINIMUM,
     accepted_date_from_decisions,
+    authors_from_row,
     editorial_move_allowed,
+    find_author_columns,
     find_decision_columns,
     map_ojs_status,
     parse_date,
@@ -100,3 +102,21 @@ def test_title_overlap_tolerates_revisions_but_catches_other_papers():
     assert title_overlap("Same Title", "same   title") == 1.0
     assert title_overlap("Sensor suhu pada inkubator", "Completely unrelated paper about gardening") < TITLE_OVERLAP_MINIMUM
     assert title_overlap("", "Anything") == 0.0
+
+
+def test_author_columns_are_grouped_by_number_and_read_in_order():
+    headers = (
+        "Submission ID", "Given Name (Author 1)", "Family Name (Author 1)", "Email (Author 1)",
+        "Bio Statement (e.g., department and rank) (Author 1)", "Given Name (Editor 1)",
+        "Given Name (Author 2)", "Family Name (Author 2)", "Email (Author 2)", "Affiliation (Author 2)",
+        "Given Name (Author 3)", "Family Name (Author 3)", "Email (Author 3)",
+    )
+    columns = find_author_columns(headers)
+    assert [sorted(group) for group in columns] == [
+        ["email", "family_name", "given_name"], ["affiliation", "email", "family_name", "given_name"], ["email", "family_name", "given_name"],
+    ]
+    cells = {1: "Ada", 2: "Lovelace", 3: "ada@example.test", 6: "Bima", 7: "", 8: "bima@example.test", 9: "Polinema", 10: "", 11: "", 12: "ghost@example.test"}
+    assert authors_from_row(columns, lambda index: cells.get(index, "")) == [
+        ("Ada Lovelace", "ada@example.test", ""), ("Bima", "bima@example.test", "Polinema"),
+    ]
+    assert find_author_columns(("id", "title")) == []

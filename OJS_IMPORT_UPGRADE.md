@@ -66,6 +66,8 @@ This revision adds reviewer names from the OJS review report and completes edito
 - `date_accepted` is filled for accepted articles from the earliest "Accept Submission" editor decision (else "Send To Production"). Articles whose report has no such decision keep an empty acceptance date.
 - `SUBMISSIONS → Import CSV/Excel` now has two tabs. **Articles report** gained the option *Complete editorial and publication status of existing submissions from OJS* (on by default). **Review report (reviewer names)** imports the OJS review export.
 - New table `submission_reviewers` (reviewer name, OJS username, round, state, recommendation, assigned/completed dates). `init_database()` creates it automatically; `migrations/003_submission_reviewers.sql` does the same explicitly. No existing table or row is changed.
+- Authors are read from the `Given Name / Family Name / Email / Affiliation (Author N)` columns of the articles report. The first named author becomes the corresponding author (with e-mail and affiliation); every named author is saved in order. Columns you map by hand still take priority.
+- A second option on the Articles tab, *Fill missing author details of existing submissions from OJS* (on by default), fills only empty corresponding author, e-mail, affiliation, and author list on existing records, including accepted and published ones. Anything already filled is never overwritten.
 - `SUBMISSIONS → All Submissions` shows a `Reviewers` column and a per-submission reviewer list (SUPER_ADMIN and JOURNAL_ADMIN only).
 
 **Status sync rules (existing records)**

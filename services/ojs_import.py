@@ -20,7 +20,9 @@ from models import Author, EditorialStatus, Invoice, Journal, LoADocument, Publi
 from services.core import assert_journal_access, log_audit
 from services.ojs_status import (
     accepted_date_from_decisions,
+    authors_from_row,
     editorial_move_allowed,
+    find_author_columns,
     find_decision_columns,
     map_ojs_status,
     parse_date,
@@ -122,6 +124,11 @@ class PreviewRow:
     # Status fields OJS will complete on an existing record, and plain-language notes about them.
     status_changes: dict[str, object] = field(default_factory=dict)
     info: list[str] = field(default_factory=list)
+    # (name, email, affiliation) per author read from the "... (Author N)" columns.
+    author_details: list[tuple[str, str, str]] = field(default_factory=list)
+    # Empty fields OJS will fill on an existing record, and whether its author list will be created.
+    blank_fills: dict[str, object] = field(default_factory=dict)
+    fill_authors: bool = False
 
 
 @dataclass
@@ -131,6 +138,7 @@ class ImportResult:
     skipped_duplicates: int = 0
     updated: int = 0
     status_updated: int = 0
+    filled: int = 0
     incomplete: int = 0
     invalid: int = 0
     errors: list[dict[str, str | int]] = field(default_factory=list)
@@ -328,6 +336,18 @@ def _describe_changes(submission: Submission, changes: dict[str, object]) -> str
     return "; ".join(parts)
 
 
+def _blank_fills(submission: Submission, values: dict[str, str]) -> dict[str, object]:
+    """Empty author fields on an existing record that the report can fill. Never overwrites."""
+    fills: dict[str, object] = {}
+    if not submission.corresponding_author and values["corresponding_author"]:
+        fills["corresponding_author"] = values["corresponding_author"]
+    if not submission.email and values["email"]:
+        fills["email"] = values["email"].lower()
+    if not submission.affiliation and values["affiliation"]:
+        fills["affiliation"] = values["affiliation"]
+    return fills
+
+
 def build_preview(
     session: Session,
     journal: Journal,
@@ -336,6 +356,7 @@ def build_preview(
     *,
     update_existing: bool = False,
     sync_status: bool = False,
+    fill_blanks: bool = False,
 ) -> list[PreviewRow]:
     if any(mapping.get(field) is None for field in REQUIRED_FIELDS):
         raise ValueError("Map OJS Submission ID and Manuscript Title before previewing or importing.")
@@ -344,12 +365,30 @@ def build_preview(
     seen: set[str] = set()
     output: list[PreviewRow] = []
     decision_columns = find_decision_columns(table.headers)
+    author_columns = find_author_columns(table.headers)
+    with_authors: set[uuid.UUID] = set()
+    if fill_blanks:
+        with_authors = set(session.scalars(
+            select(Author.submission_id).join(Submission, Submission.id == Author.submission_id).where(Submission.journal_id == journal.id)
+        ))
     for source in table.rows:
         values = {
             field: clean_text(source.values[index]) if index is not None and index < len(source.values) else ""
             for field, index in mapping.items()
         }
         values = {field: values.get(field, "") for field in FIELD_ALIASES}
+        author_details: list[tuple[str, str, str]] = []
+        if author_columns and not values["authors"]:
+            # The OJS articles report spreads authors over "... (Author N)" columns; the first
+            # named author is treated as the corresponding author unless columns are mapped.
+            author_details = authors_from_row(
+                author_columns, lambda index: clean_text(source.values[index]) if index < len(source.values) else ""
+            )
+            if author_details:
+                values["authors"] = "; ".join(name for name, _, _ in author_details)
+                values["corresponding_author"] = values["corresponding_author"] or author_details[0][0]
+                values["email"] = values["email"] or author_details[0][1]
+                values["affiliation"] = values["affiliation"] or author_details[0][2]
         ojs_id = values["ojs_submission_id"]
         issues: list[str] = []
         info: list[str] = []
@@ -424,21 +463,36 @@ def build_preview(
             if status_changes:
                 info.append("Status update: " + _describe_changes(existing, status_changes))
                 if action == "SKIP":
-                    action = "UPDATE_STATUS"
+                    action = "COMPLETE"
                     skip_reason = ""
-        if skip_reason:
-            issues.append(skip_reason)
         author_names, author_review = _authors(values["authors"])
+        if author_details:
+            author_names, author_review = [name for name, _, _ in author_details], False
         if author_review:
             issues.append("Author delimiter is uncertain; raw author text retained for review.")
         if any(len(name) > 255 for name in author_names):
             issues.append("Author name exceeds 255 characters; raw author text retained in notes.")
             author_names = []
+            author_details = []
+        blank_fills: dict[str, object] = {}
+        fill_authors = False
+        if existing is not None and fill_blanks and action != "UPDATE_METADATA":
+            blank_fills = _blank_fills(existing, values)
+            fill_authors = existing.id not in with_authors and bool(author_names or values["corresponding_author"])
+            if blank_fills or fill_authors:
+                missing = [*blank_fills, *(["authors"] if fill_authors else [])]
+                info.append("Fill missing: " + ", ".join(missing))
+                if action == "SKIP":
+                    action = "COMPLETE"
+                    skip_reason = ""
+        if skip_reason:
+            issues.append(skip_reason)
         if status == "READY" and issues:
             status = "INCOMPLETE_METADATA"
         output.append(PreviewRow(
             source.number, values, status, action, issues, existing.id if existing else None, author_names, parsed_dates, year,
             editorial or EditorialStatus.SUBMITTED, publication or PublicationStatus.NOT_READY, status_changes, info,
+            author_details, blank_fills, fill_authors,
         ))
     return output
 
@@ -462,6 +516,13 @@ def preview_table(rows: list[PreviewRow]) -> pd.DataFrame:
 
 
 def _add_authors(session: Session, submission: Submission, row: PreviewRow) -> None:
+    if row.author_details:
+        for position, (name, email, affiliation) in enumerate(row.author_details, 1):
+            submission.authors.append(Author(
+                name=name, position=position, is_corresponding=name == row.values["corresponding_author"],
+                email=email.lower() or None, affiliation=affiliation or None,
+            ))
+        return
     names = row.author_names or ([row.values["corresponding_author"]] if row.values["corresponding_author"] else [])
     for position, name in enumerate(names, 1):
         corresponding = name == row.values["corresponding_author"]
@@ -480,9 +541,10 @@ def confirm_import(
     *,
     update_existing: bool = False,
     sync_status: bool = False,
+    fill_blanks: bool = False,
 ) -> ImportResult:
     assert_journal_access(user, journal.id, {Role.SUPER_ADMIN, Role.JOURNAL_ADMIN}, session)
-    rows = build_preview(session, journal, table, mapping, update_existing=update_existing, sync_status=sync_status)
+    rows = build_preview(session, journal, table, mapping, update_existing=update_existing, sync_status=sync_status, fill_blanks=fill_blanks)
     result = ImportResult(total_rows=len(rows))
     for row in rows:
         if row.action == "SKIP":
@@ -495,10 +557,10 @@ def confirm_import(
         try:
             completed_action = row.action
             with session.begin_nested():
-                if row.action in ("UPDATE_METADATA", "UPDATE_STATUS"):
+                if row.action in ("UPDATE_METADATA", "COMPLETE"):
                     metadata = row.action == "UPDATE_METADATA"
                     item = session.get(Submission, row.existing_id)
-                    if item is None or (metadata and _protected(session, item)) or (not metadata and _has_documents(session, item)):
+                    if item is None or (metadata and _protected(session, item)) or (row.status_changes and _has_documents(session, item)):
                         result.skipped_duplicates += 1
                         result.errors.append({"source_row": row.source_row, "ojs_submission_id": row.values["ojs_submission_id"], "status": "DUPLICATE", "reason": "Existing record became protected or unavailable."})
                         continue
@@ -516,10 +578,17 @@ def confirm_import(
                             _add_authors(session, item, row)
                         raw_authors = row.values["authors"] if row.values["authors"] and not row.author_names else ""
                         item.notes = _notes(row.values["notes"] or item.notes or "", row.issues, raw_authors)
-                    for key, value in row.status_changes.items():
+                    for key, value in {**row.blank_fills, **row.status_changes}.items():
                         previous[key] = getattr(item, key)
                         setattr(item, key, value)
-                    log_audit(session, action="SUBMISSION_IMPORT_UPDATED" if metadata else "SUBMISSION_IMPORT_STATUS_SYNCED", object_type="submission", object_id=item.id, user_id=user.id, journal_id=journal.id, previous=previous, new={key: getattr(item, key) for key in previous})
+                    authors_added = 0
+                    if row.fill_authors and not item.authors:
+                        _add_authors(session, item, row)
+                        authors_added = len(item.authors)
+                    new_values = {key: getattr(item, key) for key in previous}
+                    if authors_added:
+                        new_values["authors_added"] = authors_added
+                    log_audit(session, action="SUBMISSION_IMPORT_UPDATED" if metadata else "SUBMISSION_IMPORT_COMPLETED", object_type="submission", object_id=item.id, user_id=user.id, journal_id=journal.id, previous=previous, new=new_values)
                 else:
                     raw_authors = row.values["authors"] if row.values["authors"] and not row.author_names else ""
                     item = Submission(
@@ -538,14 +607,16 @@ def confirm_import(
                     session.flush()
                     _add_authors(session, item, row)
                     log_audit(session, action="SUBMISSION_IMPORTED", object_type="submission", object_id=item.id, user_id=user.id, journal_id=journal.id, new={"ojs_submission_id": item.ojs_submission_id, "metadata_status": "INCOMPLETE_METADATA" if row.issues else "READY"})
-            if completed_action in ("UPDATE_METADATA", "UPDATE_STATUS"):
+            if completed_action in ("UPDATE_METADATA", "COMPLETE"):
                 result.updated += 1
                 if row.status_changes:
                     result.status_updated += 1
+                if row.blank_fills or row.fill_authors:
+                    result.filled += 1
             else:
                 result.imported += 1
-            # A status-only sync leaves metadata alone, so missing metadata is not reported again.
-            if row.issues and completed_action != "UPDATE_STATUS":
+            # Completing an existing record leaves the rest of its metadata alone, so it is not reported again.
+            if row.issues and completed_action != "COMPLETE":
                 result.incomplete += 1
                 result.errors.append({"source_row": row.source_row, "ojs_submission_id": row.values["ojs_submission_id"], "status": "INCOMPLETE_METADATA", "reason": "; ".join(row.issues)})
         except Exception as exc:
@@ -559,7 +630,7 @@ def confirm_import(
     log_audit(session, action="SUBMISSION_IMPORT_BATCH", object_type="submission_import", object_id=uuid.uuid4(), user_id=user.id, journal_id=journal.id,
               new={"filename": safe_filename, "total_rows": result.total_rows, "imported_rows": result.imported,
                    "skipped_rows": result.skipped_duplicates + result.invalid, "skipped_duplicate_rows": result.skipped_duplicates,
-                   "updated_rows": result.updated, "status_updated_rows": result.status_updated,
+                   "updated_rows": result.updated, "status_updated_rows": result.status_updated, "filled_rows": result.filled,
                    "invalid_rows": result.invalid, "incomplete_rows": result.incomplete})
     session.commit()
     return result

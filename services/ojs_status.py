@@ -164,3 +164,38 @@ def reviewer_display_name(given: str, family: str, full: str, username: str) -> 
     """Given + family name, else a single full-name column, else the OJS username."""
     name = " ".join(part.strip() for part in (given, family) if part and part.strip())
     return name or (full or "").strip() or (username or "").strip()
+
+
+# --- OJS articles report: author columns ----------------------------------------------------
+
+_AUTHOR_HEADER = re.compile(r"^(given_name|family_name|email|affiliation)_author_(\d+)$")
+
+
+def find_author_columns(headers: Sequence[object]) -> list[dict[str, int]]:
+    """Group the OJS "Given Name (Author N)", "Family Name (Author N)", "Email (Author N)" and
+    "Affiliation (Author N)" columns by author number. Returns one dict per author, in order,
+    with the keys given_name, family_name, email, affiliation that exist in the file."""
+    groups: dict[int, dict[str, int]] = {}
+    for index, header in enumerate(headers):
+        match = _AUTHOR_HEADER.match(normalize_token(header))
+        if match:
+            groups.setdefault(int(match.group(2)), {})[match.group(1)] = index
+    return [groups[number] for number in sorted(groups)]
+
+
+def authors_from_row(columns: Sequence[dict[str, int]], cell) -> list[tuple[str, str, str]]:
+    """(name, email, affiliation) for every author that has a name, in author order.
+
+    ``cell`` maps a column index to its cleaned text. Authors without a name are skipped.
+    """
+    authors = []
+    for group in columns:
+        name = " ".join(
+            part for part in (cell(group[key]).strip() for key in ("given_name", "family_name") if key in group) if part
+        )
+        if not name:
+            continue
+        email = cell(group["email"]).strip() if "email" in group else ""
+        affiliation = cell(group["affiliation"]).strip() if "affiliation" in group else ""
+        authors.append((name, email, affiliation))
+    return authors

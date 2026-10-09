@@ -630,8 +630,13 @@ def import_articles_report(session, journal: Journal, user: User) -> None:
         help="Forward-only: SUBMITTED or UNDER_REVIEW records can move to the OJS stage, and an accepted record becomes PUBLISHED when OJS says Published. "
              "Records that already have an LoA or invoice, and records that are rejected or withdrawn, are never changed.",
     )
+    fill_blanks = st.checkbox(
+        "Fill missing author details of existing submissions from OJS", value=True, key=f"ojs-fill-blanks-{journal.id}-{file_key}",
+        help="Fills only empty corresponding author, e-mail, affiliation, and author list, including on accepted or published records. "
+             "Anything already filled in JAS is never overwritten. The first author in the OJS report is used as the corresponding author.",
+    )
     try:
-        preview = build_preview(session, journal, table, mapping, update_existing=policy == "Update existing metadata", sync_status=sync_status)
+        preview = build_preview(session, journal, table, mapping, update_existing=policy == "Update existing metadata", sync_status=sync_status, fill_blanks=fill_blanks)
     except ValueError as exc:
         st.error(str(exc))
         return
@@ -643,7 +648,7 @@ def import_articles_report(session, journal: Journal, user: User) -> None:
     if st.button("Confirm Import", type="primary"):
         try:
             result = confirm_import(session, journal, user, table, mapping, uploaded.name,
-                                    update_existing=policy == "Update existing metadata", sync_status=sync_status)
+                                    update_existing=policy == "Update existing metadata", sync_status=sync_status, fill_blanks=fill_blanks)
             st.session_state[f"ojs-import-result-{journal.id}-{file_key}"] = result
         except Exception as exc:
             session.rollback()
@@ -651,7 +656,7 @@ def import_articles_report(session, journal: Journal, user: User) -> None:
     result = st.session_state.get(f"ojs-import-result-{journal.id}-{file_key}")
     if result:
         st.success(f"Imported: {result.imported} · Skipped duplicates: {result.skipped_duplicates} · "
-                   f"Updated: {result.updated} (status completed: {result.status_updated}) · Incomplete: {result.incomplete} · Invalid: {result.invalid}")
+                   f"Updated: {result.updated} (status completed: {result.status_updated}, details filled: {result.filled}) · Incomplete: {result.incomplete} · Invalid: {result.invalid}")
         st.download_button("Download import error report", error_report_csv(result),
                            file_name="ojs_import_errors.csv", mime="text/csv")
 

@@ -195,6 +195,8 @@ Duplikasi diperiksa dengan pasangan `journal_id + ojs_submission_id`. `Skip exis
 
 Kolom `Status` OJS dipetakan ke status JAS: `Review` → UNDER_REVIEW; `Copyediting`, `Production`, `Scheduled` → ACCEPTED; `Published` → ACCEPTED dan PUBLISHED; `Declined` → REJECTED. Tanggal accepted diambil dari keputusan editor "Accept Submission" paling awal bila laporan memuatnya. Opsi *Complete editorial and publication status of existing submissions from OJS* melengkapi status submission yang sudah ada, hanya maju (tidak pernah mundur) dan tidak menyentuh submission yang sudah memiliki LoA atau invoice.
 
+Penulis dibaca dari kolom `Given Name / Family Name / Email / Affiliation (Author N)`: penulis pertama menjadi corresponding author beserta email dan afiliasinya, dan semua penulis tersimpan berurutan. Opsi *Fill missing author details of existing submissions from OJS* hanya mengisi kolom yang masih kosong pada submission yang sudah ada (termasuk yang accepted/published) dan tidak pernah menimpa data yang sudah terisi.
+
 ### Laporan review (nama reviewer)
 
 Tab `Review report (reviewer names)` pada halaman yang sama mengimpor laporan review OJS setelah laporan artikel. Baris dicocokkan lewat OJS Submission ID pada jurnal aktif, dan judulnya diperiksa agar laporan jurnal lain tidak tersimpan ke submission yang salah. Hanya nama reviewer, username OJS, putaran, status, rekomendasi, dan dua tanggal yang disimpan; email reviewer dan komentar review diabaikan. Data tersimpan di tabel baru `submission_reviewers` (dibuat otomatis, atau jalankan `migrations/003_submission_reviewers.sql`) dan hanya tampil untuk SUPER_ADMIN dan JOURNAL_ADMIN. Mengimpor ulang file yang sama tidak membuat duplikat.
