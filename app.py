@@ -377,7 +377,8 @@ def dashboard(session, journal: Journal) -> None:
     status_frame = pd.DataFrame([x.status.value for x in invoices], columns=["Status"])
     if not status_frame.empty:
         st.subheader("Invoice status distribution")
-        st.bar_chart(status_frame.value_counts().rename("Count"))
+        status_counts = status_frame["Status"].value_counts().rename_axis("Status").reset_index(name="Count")
+        st.bar_chart(status_counts, x="Status", y="Count", use_container_width=True)
 
 
 def all_submissions(session, journal: Journal, user: User) -> None:
