@@ -356,12 +356,27 @@ def elkolind_master_warnings(content: bytes) -> list[str]:
     return warnings
 
 
+ADVISORY_MASTER_WARNINGS = ("No native PAGE field", "No footer image")
+
+
+def elkolind_master_blockers(content: bytes) -> list[str]:
+    """Master problems that actually prevent generation.
+
+    ``elkolind_master_warnings`` also reports two advisory notes: a missing PAGE field
+    (JAS adds one itself during generation) and a missing footer image (only needs a
+    visual check). Those must stay visible to the administrator but must never stop
+    generation; only real structural problems should.
+    """
+    return [text for text in elkolind_master_warnings(content)
+            if not text.startswith(ADVISORY_MASTER_WARNINGS)]
+
+
 def graft_article_master_header_footer(
     manuscript: bytes, master: bytes, values: dict[str, str], *, elkolind: bool = False
 ) -> tuple[bytes, dict[str, object]]:
     """Copy master page variants, styles and dependent media into a manuscript copy."""
     if elkolind:
-        warnings = elkolind_master_warnings(master)
+        warnings = elkolind_master_blockers(master)
         if warnings:
             raise ArticleMetadataError(
                 "Active ELKOLIND Article Master failed validation: " + "; ".join(warnings)

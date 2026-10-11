@@ -17,7 +17,7 @@ from services.article_formatting import (
     compliance_score, formatting_integrity,
 )
 from services.article_metadata import (
-    elkolind_master_warnings, graft_article_master_header_footer, graft_integrity,
+    elkolind_master_blockers, elkolind_master_warnings, graft_article_master_header_footer, graft_integrity,
     resolve_elkolind_metadata,
 )
 from services.article_template_service import (
@@ -69,26 +69,30 @@ def _compliance_findings(manuscript: bytes, template: bytes, config: dict[str, o
     findings = [item for item in findings if not (
         item.category == "Document" and item.check in {"Header", "Footer", "Page numbering"}
     )]
-    warnings = elkolind_master_warnings(template)
-    if warnings:
+    blockers = elkolind_master_blockers(template)
+    if blockers:
         findings.append(Finding(
             id="document:article_master_header_footer:validation",
             category="Document",
             check="ELKOLIND Article Master header/footer",
             expected="Valid active master with dynamic metadata placeholders and native PAGE field",
-            detected="; ".join(warnings),
+            detected="; ".join(blockers),
             status="MANUAL_ACTION_REQUIRED",
             target=MASTER_HEADER_FOOTER_TARGET,
         ))
         return findings
 
+    # Advisory-only notes (JAS adds its own PAGE field; a missing footer image only
+    # needs a visual check) are shown but must never block generation.
+    advisory = elkolind_master_warnings(template)
     findings.extend((
         Finding(
             id="document:article_master_header_footer:validation",
             category="Document",
             check="ELKOLIND Article Master header/footer",
             expected="Valid active master with dynamic metadata placeholders and native PAGE field",
-            detected="Validated active Article Master",
+            detected="Validated active Article Master" + (
+                " (advisory: " + "; ".join(advisory) + ")" if advisory else ""),
             status="COMPLIANT",
             target=MASTER_HEADER_FOOTER_TARGET,
         ),
