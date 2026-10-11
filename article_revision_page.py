@@ -366,7 +366,7 @@ def quick_template_revision_page(session: Session, journal: Journal, user: User)
             except Exception as exc:
                 session.rollback()
                 st.error(str(exc))
-    elif job.status in {"UPLOADED", "ANALYZED", "REVIEW_REQUIRED", "READY_TO_FORMAT"} and st.button(
+    elif job.status in {"UPLOADED", "ANALYZED", "REVIEW_REQUIRED", "READY_TO_FORMAT", "INTEGRITY_FAILED"} and st.button(
         "Run Template Compliance Check", key=f"article-audit-{job.id}"
     ):
         try:

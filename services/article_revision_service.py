@@ -243,7 +243,7 @@ def _read_original(job: ArticleRevisionJob, store: RevisionStorage) -> bytes:
 def audit_article_revision_job(session: Session, journal: Journal, user: User, job_id: uuid.UUID,
                                *, storage: RevisionStorage | None = None) -> list[Finding]:
     job = _job(session, journal, user, job_id)
-    if job.status not in {"UPLOADED", "ANALYZED", "REVIEW_REQUIRED", "READY_TO_FORMAT"}:
+    if job.status not in EDITABLE_STATUSES:
         raise ArticleRevisionRuleError("This job cannot be re-analyzed after formatting.")
     store = storage or get_revision_storage()
     original = _read_original(job, store)
