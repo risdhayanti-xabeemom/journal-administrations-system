@@ -135,6 +135,73 @@ def test_formatting_is_idempotent_once_compliant():
     assert not [item for item in findings if item.status == "SAFE_FIX_AVAILABLE"]
 
 
+def _set_numpr(paragraph, *, num_id: str, ilvl: int) -> None:
+    """Attach Word's own multilevel-list numbering (no literal "1." typed into the run text).
+
+    This is how Word's Format > Bullets and Numbering (multilevel list) feature renders
+    section numbers: the "1."/"2.1" prefix is drawn from word/numbering.xml at render time and
+    never appears in the paragraph's own w:t text, which is exactly what analyze_manuscript
+    must recognize a heading from without a real numbering.xml (it only reads w:numPr/w:numId
+    and w:ilvl off the paragraph itself).
+    """
+    from docx.oxml.ns import qn
+
+    p_pr = paragraph._p.get_or_add_pPr()
+    num_pr = p_pr.makeelement(qn("w:numPr"), {})
+    ilvl_el = p_pr.makeelement(qn("w:ilvl"), {qn("w:val"): str(ilvl)})
+    num_id_el = p_pr.makeelement(qn("w:numId"), {qn("w:val"): num_id})
+    num_pr.append(ilvl_el)
+    num_pr.append(num_id_el)
+    p_pr.insert(0, num_pr)
+
+
+def _manuscript_with_word_numbered_headings() -> bytes:
+    """Section headings numbered by Word's list feature, like job 11454's real manuscript.
+
+    Regression for a bug where a manuscript using this (common) numbering style was never
+    recognized past its front matter at all: _kind()'s heading regex needs a literal leading
+    digit in the paragraph text, which a Word-numbered heading does not have (the paragraph
+    text is just "PENDAHULUAN", not "1. PENDAHULUAN"), and falls back to a "Heading N" Word
+    style, which a numbered-list paragraph ("List Paragraph" style) also doesn't carry. With
+    neither signal, every paragraph for the rest of the document -- the entire body, not just
+    the real front matter -- stayed classified as FRONT_MATTER, so every body paragraph's exact
+    text got appended to structure.authors/.affiliations and (via _role() in
+    article_formatting.py) every body paragraph was then formatted as a bold, centered author
+    line instead of normal justified body text: "Integrity" wasn't the problem, the whole
+    article just came out looking wrong, which is what the user saw and reported.
+    """
+    document = Document()
+    _para(document, "RANCANG BANGUN ALAT UJI ADC0804 DAN DAC0808-LM741", size=24)
+    _para(document, "Fauziah Sholikhatun Nisa", size=10)
+    _para(document, "Jurusan Teknik Elektro, Politeknik Negeri Malang", size=10)
+    heading = _para(document, "PENDAHULUAN", bold=True, size=10, align=WD_ALIGN_PARAGRAPH.CENTER)
+    _set_numpr(heading, num_id="1", ilvl=0)
+    intro = document.add_paragraph()
+    intro.add_run("Perkembangan teknologi elektronika digital mendorong penggunaan sistem.")
+    intro.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+    subheading = _para(document, "Tahapan Penelitian", bold=True, size=10, align=WD_ALIGN_PARAGRAPH.LEFT)
+    _set_numpr(subheading, num_id="1", ilvl=1)
+    method = document.add_paragraph()
+    method.add_run("Penelitian ini merancang dan mengkarakterisasi alat uji.")
+    method.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+    return _save(document)
+
+
+def test_word_numbered_section_headings_close_the_front_matter():
+    structure = analyze_manuscript(_manuscript_with_word_numbered_headings())
+    heading = next(item for item in structure.paragraphs if item.text.strip() == "PENDAHULUAN")
+    assert heading.kind == "SECTION_HEADING"
+    assert heading.section_id == "SECTION_1"
+    subheading = next(item for item in structure.paragraphs if item.text.strip() == "Tahapan Penelitian")
+    assert subheading.kind == "SECTION_HEADING"
+    assert subheading.section_id == "SECTION_1_1"
+    body = next(item for item in structure.paragraphs
+                if item.text.startswith("Perkembangan teknologi elektronika digital"))
+    assert body.section_id != "FRONT_MATTER"
+    assert body.text not in structure.authors
+    assert body.text not in structure.affiliations
+
+
 def test_submission_dates_replace_xx_placeholders():
     assert format_metadata_date("2026-07-01") == "01/07/2026"
     assert format_metadata_date("03/08/2026") == "03/08/2026"

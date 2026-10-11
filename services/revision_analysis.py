@@ -97,6 +97,19 @@ AFFILIATION_RE = re.compile(
     r"jurusan|program studi|\bprodi\b|\bjalan\b|\bjl\.|kampus|campus|\bkota\b|\bkabupaten\b|\bindonesia\b|"
     r"\bpo\.? ?box\b|\b\d{5}\b", re.I)
 
+# Top-level ELKOLIND section names, used to recognize a section heading whose "1."/"2." number
+# is rendered by Word's own multilevel-list numbering (w:numPr) rather than typed into the run
+# text -- a common authoring pattern that leaves no leading digit in _paragraph_text()'s output
+# for _kind()'s text-based heading regex to match. Keep in sync with
+# services.article_formatting.ELKOLIND_SECTION_NAMES (that module imports this set rather than
+# redefining it, to avoid the two drifting apart).
+KNOWN_SECTION_HEADING_NAMES = {
+    "pendahuluan", "introduction", "metode penelitian", "methodology", "methods",
+    "hasil dan pembahasan", "results and discussion", "kesimpulan", "conclusion",
+    "ucapan terimakasih", "ucapan terima kasih", "acknowledgements", "acknowledgments",
+    "daftar pustaka", "references", "bibliography",
+}
+
 
 def _kind(text: str, style: str, in_table: bool) -> str:
     lower = text.lower().strip()
@@ -134,6 +147,7 @@ def analyze_manuscript(content: bytes) -> ManuscriptStructure:
     in_references = False
     table_captions: list[str] = []
     figure_captions: list[str] = []
+    heading_num_id: str | None = None
     for index, para in enumerate(body.xpath(".//w:p", namespaces=NS), 1):
         text = _paragraph_text(para)
         style_values = para.xpath("./w:pPr/w:pStyle/@w:val", namespaces=NS)
@@ -141,6 +155,32 @@ def analyze_manuscript(content: bytes) -> ManuscriptStructure:
         in_table = any(ancestor.tag == f"{{{W}}}tbl" for ancestor in para.iterancestors())
         kind = _kind(text, style, in_table)
         heading_text = re.sub(r"^\d+(?:\.\d+)*\.?\s+", "", text.strip()).lower()
+        numbered_level: int | None = None
+        if kind != "SECTION_HEADING" and not in_table and text.strip():
+            # Word's own multilevel-list numbering (Format > Bullets and Numbering, used instead
+            # of typing "1." by hand) renders "1.", "2.1", etc. from word/numbering.xml and never
+            # puts that digit in the run text, so the regex-based heading detection above sees
+            # just "PENDAHULUAN" / "METODE PENELITIAN" and misses it entirely -- leaving the
+            # whole manuscript classified as front matter and every body paragraph misread as an
+            # author/affiliation line. Recognize it instead by list level: a level-0 numbered
+            # paragraph whose text matches a known top-level ELKOLIND section name opens a
+            # section, and later paragraphs sharing that same numbering list id become its
+            # (sub)headings, regardless of their own wording.
+            numid_values = para.xpath("./w:pPr/w:numPr/w:numId/@w:val", namespaces=NS)
+            ilvl_values = para.xpath("./w:pPr/w:numPr/w:ilvl/@w:val", namespaces=NS)
+            if numid_values and ilvl_values:
+                numid, ilvl_text = numid_values[0], ilvl_values[0]
+                try:
+                    ilvl = int(ilvl_text)
+                except ValueError:
+                    ilvl = None
+                if ilvl == 0 and heading_text in KNOWN_SECTION_HEADING_NAMES:
+                    kind = "SECTION_HEADING"
+                    heading_num_id = numid
+                    numbered_level = 1
+                elif ilvl is not None and ilvl > 0 and heading_num_id is not None and numid == heading_num_id:
+                    kind = "SECTION_HEADING"
+                    numbered_level = min(ilvl + 1, 4)
         if not title and text.strip() and (style.lower() == "title" or not paragraphs):
             title = text.strip()
         if kind == "SECTION_HEADING" or heading_text in {"references", "bibliography", "daftar pustaka"}:
@@ -148,6 +188,8 @@ def analyze_manuscript(content: bytes) -> ManuscriptStructure:
             matched = re.match(r"Heading(\d+)", style, re.I)
             if matched:
                 heading_level = min(int(matched.group(1)), 4)
+            elif numbered_level is not None:
+                heading_level = numbered_level
             else:
                 number = re.match(r"^(\d+(?:\.\d+)*)", text)
                 if number:

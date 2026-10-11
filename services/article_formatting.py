@@ -17,7 +17,8 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 
 from services.revision_analysis import (
-    FIGURE_CAPTION_RE, NS, TABLE_CAPTION_RE, W, analyze_manuscript, citation_tokens, numeric_tokens,
+    FIGURE_CAPTION_RE, KNOWN_SECTION_HEADING_NAMES, NS, TABLE_CAPTION_RE, W, analyze_manuscript, citation_tokens,
+    numeric_tokens,
 )
 from services.revision_docx import ApprovedPatch, check_integrity
 
@@ -50,12 +51,9 @@ ROLE_STYLE = {"title": "Title", "body": "Normal", "heading1": "Heading 1", "head
 W_TAG = f"{{{W}}}"
 ELKOLIND_FORMAT_TARGET = "ELKOLIND_SEMANTIC_FORMATTING"
 ELKOLIND_FORMAT_FIX_ID = "document:elkolind_semantic_formatting:apply"
-ELKOLIND_SECTION_NAMES = {
-    "pendahuluan", "introduction", "metode penelitian", "methodology", "methods",
-    "hasil dan pembahasan", "results and discussion", "kesimpulan", "conclusion",
-    "ucapan terimakasih", "ucapan terima kasih", "acknowledgements", "acknowledgments",
-    "daftar pustaka", "references", "bibliography",
-}
+# Kept as an alias (not a redefinition) so the two modules' notion of "known section name"
+# can't drift apart -- see KNOWN_SECTION_HEADING_NAMES's docstring in revision_analysis.py.
+ELKOLIND_SECTION_NAMES = KNOWN_SECTION_HEADING_NAMES
 ELKOLIND_ROLE_SPECS: dict[str, dict[str, object]] = {
     "title": {"font": "Gadugi", "size": 48, "alignment": 1},
     "author": {"font": "Gadugi", "size": 20, "alignment": 1, "bold": True},
