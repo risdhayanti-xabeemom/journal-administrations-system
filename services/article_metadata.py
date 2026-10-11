@@ -634,6 +634,17 @@ def graft_integrity(before: bytes, after: bytes, values: dict[str, str], *, elko
         )
         expected_body = _xml(source.read("word/document.xml"))
         _replace_tokens(expected_body, values)
+        # Round-trip through the same serialize/reparse the real graft output already went
+        # through (read back from a zip). lxml normalizes an in-memory empty string left on a
+        # run that _splice_text_nodes blanked out (text == "") to no text node at all (text is
+        # None) once it has been serialized and reparsed. Without this, "expected" keeps the
+        # pre-round-trip empty strings in its text() list and in tostring() of any ancestor
+        # <w:tbl>/<w:drawing>/<w:oMath>, while "actual" never had them to begin with -- a
+        # cosmetic XML-serialization difference, not a real content change, that otherwise
+        # fails body_text_only_expected_metadata_changed and tables_figures_equations_preserved
+        # for any manuscript whose metadata placeholder (e.g. a "Received:"/"Revised:"/
+        # "Accepted:" date) spans more than one Word run.
+        expected_body = _xml(_bytes(expected_body))
         actual_body = _xml(result.read("word/document.xml"))
         text_expected = expected_body.xpath(".//w:t/text()", namespaces=NS)
         text_actual = actual_body.xpath(".//w:t/text()", namespaces=NS)

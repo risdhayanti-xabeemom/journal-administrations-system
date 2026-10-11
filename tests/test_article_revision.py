@@ -1022,6 +1022,53 @@ def test_elkolind_body_dates_are_targeted_placeholders_only():
         assert "Kp = 2.55" in body
 
 
+def test_elkolind_body_date_placeholder_split_across_table_runs_passes_graft_integrity():
+    """Regression: a multi-run metadata placeholder must not look like an integrity violation.
+
+    graft_integrity() built its "expected" body by running _replace_tokens on a freshly
+    parsed, never-serialized tree, then compared it against the real graft output, which had
+    already gone through one serialize -> zip -> reparse round trip. lxml normalizes an
+    in-memory empty string left on a run that _splice_text_nodes blanked out (``.text == ""``)
+    to no text node at all (``.text is None``) once that run has been serialized and
+    reparsed. So whenever a placeholder (here the "Received:xx/xx/xxxx" date pattern) spans
+    more than one Word run -- which happens whenever Word (or an upstream edit) splits a run,
+    and is common inside tables -- "expected" kept extra empty-string entries in its
+    ``.//w:t/text()`` list and extra ``<w:t></w:t>`` bytes in its enclosing ``<w:tbl>`` that
+    "actual" never had, falsely failing body_text_only_expected_metadata_changed and
+    tables_figures_equations_preserved and blocking generation with
+    "Integrity check failed; finalization is blocked." even though the manuscript's science
+    was untouched.
+    """
+    manuscript = Document(io.BytesIO(_manuscript()))
+    table = manuscript.add_table(rows=1, cols=1)
+    table.rows[0].cells[0].paragraphs[0].text = "Received:xx/xx/xxxx"
+    original = _save(manuscript)
+    word = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    with ZipFile(io.BytesIO(original)) as archive:
+        files = {name: archive.read(name) for name in archive.namelist()}
+        members = archive.infolist()
+    root = etree.fromstring(files["word/document.xml"])
+    _split_placeholder_runs(root, ("xx/xx/xxxx",))
+    files["word/document.xml"] = etree.tostring(root, encoding="UTF-8", xml_declaration=True, standalone=True)
+    output = io.BytesIO()
+    with ZipFile(output, "w", ZIP_DEFLATED) as archive:
+        for member in members:
+            archive.writestr(member, files[member.filename])
+    original = output.getvalue()
+
+    values = resolve_elkolind_metadata({"volume": "13", "issue": "3",
+        "publication_month": "September", "publication_year": "2026", "doi_suffix": "11454",
+        "first_author": "A. Author", "received_date": "2026-01-01"},
+        "Controlled Revision of a Novel Method")
+    formatted, details = graft_article_master_header_footer(original, _elkolind_template(), values, elkolind=True)
+    assert details["metadata_replacements"] >= 1
+    check = graft_integrity(original, formatted, values, elkolind=True)
+    assert check["passed"], check["checks"]
+    with ZipFile(io.BytesIO(formatted)) as package:
+        body = package.read("word/document.xml").decode()
+        assert "Received:01/01/2026" in body
+
+
 def test_elkolind_metadata_correction_and_template_reselection_are_audited(case):
     session, store, journal, _, editor, _, _, submission = case
     first = upload_article_template(session, journal, editor, filename="ELK_Article_v1.docx",
