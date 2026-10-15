@@ -251,6 +251,7 @@ Reissue tidak pernah menimpa dokumen lama. LoA lama menjadi `SUPERSEDED`, PDF/DO
 
 - Windows lokal: `auto` mencoba Microsoft Word, lalu LibreOffice bila tersedia.
 - Docker/produksi: image memasang LibreOffice Writer dan Compose menetapkan `libreoffice`.
+- Streamlit Community Cloud: platform ini hanya membaca `requirements.txt` untuk paket Python; paket sistem (apt) seperti LibreOffice harus didaftarkan di `packages.txt` pada root repo (sudah disertakan: `libreoffice-writer`, `fonts-dejavu-core`, `fonts-liberation`). Tanpa `packages.txt`, `soffice` tidak ada di PATH dan "Generate Preview"/`Issue LoA` gagal dengan "LibreOffice is not configured". Setelah `packages.txt` ditambahkan atau diubah, lakukan **Reboot app** (bukan sekadar rerun) dari menu Streamlit Cloud agar paket sistem terpasang.
 - Instalasi khusus: isi `LIBREOFFICE_PATH` dengan executable yang benar.
 - Bila converter tidak tersedia, sistem mempertahankan DOCX dan menampilkan kesalahan konfigurasi beserta tombol unduh; sistem tidak mencatat PDF sebagai berhasil.
 
