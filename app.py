@@ -111,13 +111,118 @@ st.set_page_config(page_title="Journal Administration System", page_icon="📚",
 st.markdown(
     """
     <style>
+    @import url('https://fonts.googleapis.com/css2?family=Baloo+2:wght@500;600;700;800&family=Inter:wght@400;500;600;700&display=swap');
+
+    :root {
+        --jas-ink: #15130E;
+        --jas-cream: #F7EFD8;
+        --jas-cream-deep: #F1E6C8;
+        --jas-surface: #FFFDF7;
+        --jas-blue: #2F6FED;
+        --jas-green-bg: #CFF3D3; --jas-green-text: #1B5E20;
+        --jas-amber-bg: #FDE1A8; --jas-amber-text: #7A4800;
+        --jas-purple-bg: #E6DAFB; --jas-purple-text: #3B1E8C;
+        --jas-red-bg: #FBD9D6; --jas-red-text: #8A1C13;
+        --jas-shadow-sm: 3px 3px 0 rgba(21,19,14,.85);
+        --jas-shadow-lg: 6px 6px 0 rgba(21,19,14,.9);
+    }
+
+    html, body, [data-testid="stAppViewContainer"], [data-testid="stHeader"] {
+        font-family: 'Inter', sans-serif;
+        color: var(--jas-ink);
+    }
+    [data-testid="stHeader"] {background: transparent;}
+    [data-testid="stSidebar"] > div:first-child {border-right: 2px solid var(--jas-ink);}
+
+    h1, h2, h3, .jas-display {font-family: 'Baloo 2', sans-serif; font-weight: 700; color: var(--jas-ink);}
+    h1 {font-weight: 800;}
+
     .block-container {padding-top: 1.5rem; padding-bottom: 3rem;}
-    [data-testid="stMetric"] {background:#f8fafc;border:1px solid #e2e8f0;padding:14px;border-radius:12px;}
-    [data-testid="stSidebar"] {border-right:1px solid #e2e8f0;}
-    .jas-eyebrow {color:#2563eb;font-weight:700;letter-spacing:.08em;font-size:.78rem;text-transform:uppercase;}
-    .jas-muted {color:#64748b;font-size:.9rem;}
-    .jas-valid {padding:18px;border:1px solid #86efac;background:#f0fdf4;border-radius:12px;}
-    .jas-invalid {padding:18px;border:1px solid #fca5a5;background:#fef2f2;border-radius:12px;}
+
+    /* Buttons */
+    .stButton > button, .stDownloadButton > button, .stFormSubmitButton > button, .stLinkButton > a {
+        border: 2px solid var(--jas-ink) !important;
+        border-radius: 12px !important;
+        background: var(--jas-surface) !important;
+        color: var(--jas-ink) !important;
+        font-weight: 600;
+        box-shadow: var(--jas-shadow-sm);
+        transition: transform .08s ease, box-shadow .08s ease;
+    }
+    .stButton > button:hover, .stDownloadButton > button:hover, .stFormSubmitButton > button:hover {
+        transform: translate(-1px,-1px); box-shadow: 4px 4px 0 rgba(21,19,14,.9);
+    }
+    .stButton > button:active, .stFormSubmitButton > button:active {
+        transform: translate(1px,1px); box-shadow: 1px 1px 0 rgba(21,19,14,.9);
+    }
+    .stButton > button[kind="primary"], .stFormSubmitButton > button[kind="primary"] {
+        background: var(--jas-blue) !important; color: #fff !important; border-color: var(--jas-ink) !important;
+    }
+
+    /* Inputs */
+    [data-testid="stTextInput"] input, [data-testid="stNumberInput"] input,
+    [data-testid="stDateInput"] input, [data-baseweb="select"] > div, [data-baseweb="textarea"] textarea,
+    [data-testid="stFileUploaderDropzone"] {
+        border: 2px solid var(--jas-ink) !important;
+        border-radius: 10px !important;
+        background: var(--jas-surface) !important;
+    }
+
+    /* Metrics -> stat cards */
+    [data-testid="stMetric"] {
+        background: var(--jas-surface);
+        border: 2px solid var(--jas-ink);
+        border-radius: 14px;
+        padding: 14px 18px;
+        box-shadow: var(--jas-shadow-sm);
+    }
+
+    /* Tabs */
+    [data-testid="stTabs"] [data-baseweb="tab-list"] {gap: 4px; border-bottom: 2px solid var(--jas-ink);}
+    [data-testid="stTabs"] button[role="tab"] {font-weight: 600; color: #6b6450;}
+    [data-testid="stTabs"] button[aria-selected="true"] {color: var(--jas-blue) !important;}
+    [data-testid="stTabs"] [data-baseweb="tab-highlight"] {background-color: var(--jas-blue) !important; height: 3px;}
+
+    /* Sidebar navigation */
+    [data-testid="stSidebar"] [data-testid="stRadio"] label {
+        padding: 6px 10px; border-radius: 10px; width: 100%;
+    }
+    [data-testid="stSidebar"] [data-testid="stRadio"] label:hover {background: rgba(21,19,14,.06);}
+    [data-testid="stSidebar"] [data-testid="stRadio"] label:has(input:checked) {background: var(--jas-blue);}
+    [data-testid="stSidebar"] [data-testid="stRadio"] label:has(input:checked) p {color: #fff !important; font-weight: 600;}
+
+    /* Alerts */
+    [data-testid="stAlert"] {border: 2px solid var(--jas-ink); border-radius: 12px;}
+
+    /* Expander and bordered containers */
+    [data-testid="stExpander"], div[data-testid="stVerticalBlockBorderWrapper"] {
+        border: 2px solid var(--jas-ink) !important;
+        border-radius: 14px !important;
+        background: var(--jas-surface);
+    }
+
+    /* Dataframes */
+    [data-testid="stDataFrame"] {border: 2px solid var(--jas-ink); border-radius: 12px; overflow: hidden;}
+
+    /* Badge pills */
+    .jas-pill {
+        display: inline-flex; align-items: center; gap: 6px; padding: 6px 14px; margin: 2px 6px 2px 0;
+        border-radius: 999px; border: 2px solid var(--jas-ink); font-weight: 600; font-size: .82rem;
+    }
+    .jas-pill-green {background: var(--jas-green-bg); color: var(--jas-green-text);}
+    .jas-pill-amber {background: var(--jas-amber-bg); color: var(--jas-amber-text);}
+    .jas-pill-purple {background: var(--jas-purple-bg); color: var(--jas-purple-text);}
+
+    /* Hero card */
+    .jas-hero {
+        background: var(--jas-surface); border: 2px solid var(--jas-ink); border-radius: 20px;
+        padding: 28px 32px; box-shadow: var(--jas-shadow-lg); margin-bottom: 1.5rem;
+    }
+
+    .jas-eyebrow {color: var(--jas-blue); font-weight: 700; letter-spacing: .04em; font-size: .78rem;}
+    .jas-muted {color: #6b6450; font-size: .9rem;}
+    .jas-valid {padding: 18px; border: 2px solid var(--jas-ink); background: var(--jas-green-bg); color: var(--jas-green-text); border-radius: 14px; box-shadow: var(--jas-shadow-sm);}
+    .jas-invalid {padding: 18px; border: 2px solid var(--jas-ink); background: var(--jas-red-bg); color: var(--jas-red-text); border-radius: 14px; box-shadow: var(--jas-shadow-sm);}
     </style>
     """,
     unsafe_allow_html=True,
@@ -265,9 +370,19 @@ def render_author_payment(token: str) -> None:
 def render_login() -> None:
     left, center, right = st.columns([1, 1.1, 1])
     with center:
-        st.markdown('<div class="jas-eyebrow">Academic journal operations</div>', unsafe_allow_html=True)
-        st.title("Journal Administration System")
-        st.caption("Sign in with an administrator-issued account.")
+        st.markdown(
+            """
+            <div class="jas-hero">
+                <div class="jas-eyebrow">Academic journal operations</div>
+                <h1 style="margin:.2rem 0 .3rem;">Journal Administration System</h1>
+                <p class="jas-muted" style="margin-bottom:.9rem;">Sign in with an administrator-issued account.</p>
+                <span class="jas-pill jas-pill-green">Format resmi jurnal terjaga</span>
+                <span class="jas-pill jas-pill-amber">Data submission terkunci</span>
+                <span class="jas-pill jas-pill-purple">Verifikasi dokumen resmi</span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
         with SessionLocal() as session:
             user_count = session.scalar(select(func.count(User.id))) or 0
         if user_count == 0:
@@ -342,7 +457,18 @@ def item_invoices(item: Submission) -> list[Invoice]:
 
 
 def dashboard(session, journal: Journal) -> None:
-    st.title("Dashboard")
+    st.markdown(
+        f"""
+        <div class="jas-hero">
+            <div class="jas-eyebrow">{journal.abbreviation} · {journal.name}</div>
+            <h1 style="margin:.2rem 0 .6rem;">Dashboard</h1>
+            <span class="jas-pill jas-pill-green">Alur editorial terpantau</span>
+            <span class="jas-pill jas-pill-amber">Pembayaran terverifikasi</span>
+            <span class="jas-pill jas-pill-purple">Dokumen resmi tercatat</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
     submissions = list(session.scalars(select(Submission).where(Submission.journal_id == journal.id)))
     invoices = list(session.scalars(select(Invoice).where(Invoice.journal_id == journal.id)))
     payments = list(session.scalars(select(Payment).join(Invoice).where(Invoice.journal_id == journal.id)))
